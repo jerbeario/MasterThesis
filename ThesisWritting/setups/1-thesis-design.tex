@@ -1,0 +1,78 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% setup.tex
+% Main tex file for setup and content collocation
+% For the use of University of Amsterdam
+% Information Systems and Data Science students
+% Adapted by Riccardo Fiorista (riccardo.fiorista@proton.me)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Options:
+%% `nolinenumbering` - If you want to remove line numbering on submission
+%% `draftmargins` - If you would like to give your reviewer more space for comments
+\documentclass[]{thesisdesign}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DOCUMENT METADATA
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Thesis related entries
+\title{Multi-Hazard Susceptibility Mapping in Europe Using Deep Learning}
+\subtitle{Submitted on: \textbf{DD-MM-YYYY}}
+
+% Author data
+\authorname{Jeremy Palmerio}
+\authoremail{jeremy.palmerio@student.uva.nl}
+% ACM-sepecific entries
+\affiliation{
+    \institution{\thesisinstitution}
+    \city{\thesiscity}
+    \country{\thesiscountry}
+}
+
+% Supervisor data
+\authorname{Dr. Timothy Tiggeloven}
+\authoremail{timothy.tiggeloven@vu.nl}
+% ACM-sepecific entries
+\affiliation{
+    \institution{Vrije Universiteit}
+    \city{\thesiscity}
+    \country{\thesiscountry}
+}
+
+% Supervisor data
+\authorname{Dr. Maarten Marx}
+\authoremail{M.J.Marx@uva.nl}
+% ACM-sepecific entries
+\affiliation{
+    \institution{\thesisinstitution}
+    \city{\thesiscity}
+    \country{\thesiscountry}
+}
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% CONTENT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{document}
+
+\pagestyle{plain}
+\setcounter{page}{0}
+\fixemptypage
+
+\maketitle
+
+% Sections; Try to stick to this setup
+\input{sections/1-thesis-design/1-introduction.tex}
+\input{sections/1-thesis-design/2-related-work.tex}
+\input{sections/1-thesis-design/3-methodology.tex}
+\input{sections/1-thesis-design/4-risk-assessment.tex}
+\input{sections/1-thesis-design/5-project-plan.tex}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{bibliographies/references}
+
+\end{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

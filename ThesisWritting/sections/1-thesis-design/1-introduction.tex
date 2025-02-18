@@ -1,0 +1,35 @@
+\section{Introduction}
+\label{sec:introduction}
+% Mention scientific field, problem statement, and the research gap you wish to address. 
+% This document is \textbf{not} compulsory and presents a way to present a proposal for a thesis outside the Marketplace. This \textbf{Proposal} allows you to present what you would like to work on. It should be immediately clear how your research is scientifically relevant. Make clear to which key papers you will compare your eventual results. 
+% \TODO{This is a TODO} This is a test citation \cite{Gruber1995} 
+
+% Towards the end of the introduction, you should also add your \textit{preliminary} \textbf{reasearch questions (RQ)} here. You may want to state your main RQ like this:
+
+% \noindent\textit{To what extent can a master thesis template enhance the quality of the final thesis?}\REMARK{This is a remark}
+% You can then list the sub-questions as:
+% \begin{itemize}
+%     \item How does the structure of the template influence the final grading?
+%     \item To what extent is textual guidance sufficient for structured working?
+%     \item \dots
+% \end{itemize}
+
+Natural hazards such as floods, droughts, landslides, and earthquakes present significant risks across Europe \cite{EU}. Understanding the susceptibility of regions to these hazards is essential for effective disaster risk management and planning. Multi-hazard susceptibility mapping is a tool for identifying areas at risk, but existing methods often focus on single hazards or lack a standardized approach for integrating multiple hazards.
+
+This research builds on the methodology in development by Tiggeloven et al., which applied deep learning techniques to map multi-hazard susceptibility in Japan. This study adapts the same approach for Europe, addressing regional differences in hazard characteristics and data availability. Unlike the Japan study, where feature engineering was a central focus, this work uses pre-engineered features prepared by the supervisor, allowing the study to focus on deep learning modeling and validation.
+
+Supervised learning techniques, including Convolutional Neural Networks (CNNs) and Transformers, will be used to model hazard susceptibility. The Hazard Event Sets (MYRIAD-HES) will serve as ground truth for validation, providing labeled data for evaluating model performance. This dataset contains global multi-hazard events, spanning from 2004 to 2017, which includes eleven hazards (coldwaves, heatwaves, droughts, earthquakes, extreme wind events, floods, landslides, tropical cyclones, tsunamis, volcanic eruptions, and wildfires) \cite{claassen_2023_myriad}. Transfer learning will also be explored to improve predictions for hazards, such as earthquakes, where data is less comprehensive.
+Supervised learning techniques, including Convolutional Neural Networks (CNNs) and Transformers, will be used to model hazard susceptibility. The Hazard Event Sets (MYRIAD-HES) will serve as ground truth for validation, providing labeled data for evaluating model performance. This dataset contains global multi-hazard events, spanning from 2004 to 2017, which includes eleven hazards (coldwaves, heatwaves, droughts, earthquakes, extreme wind events, floods, landslides, tropical cyclones, tsunamis, volcanic eruptions, and wildfires) \cite{claassen_2023_myriad}. Transfer learning will also be explored to improve predictions for hazards, such as earthquakes, where data is less comprehensive.
+
+
+Current approaches to multi-hazard susceptibility mapping are often limited in scope, focusing on single hazards or small geographic areas. \cite{Pourghasemi} While statistical methods and machine learning techniques have been applied in some contexts, their ability to model interactions between hazards remains underexplored in Europe. The unpublished study by Tiggeloven et al. demonstrated the effectiveness of deep learning in integrating multiple hazards for Japan. However, the applicability of this framework to other regions, such as Europe, has not been validated \cite{SAKICTROGRLIC2024103774}.
+
+\subsection{Research Question}
+How can a deep learning framework be adapted to map multi-hazard susceptibility across Europe effectively?
+
+\subsection{Sub-Questions}
+\begin{itemize}
+    \item What are the most effective deep learning architectures (CNNs, Transformers) for multi-hazard susceptibility modeling?
+	\item How can transfer learning from the Japan study improve model performance for data-scarce hazards in Europe?
+	\item How do susceptibility patterns vary across Europe, and what are the implications for disaster preparedness?
+\end{itemize}
