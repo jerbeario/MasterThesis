@@ -1,0 +1,17 @@
+name: MasterThesis
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - cartopy
+  - scikit-learn
+  - pandas
+  - matplotlib
+  - seaborn
+  - numpy
+  - jupyter
+  - libgdal
+  - gdal
+  - geopandas
+  - rasterio
+prefix: /Users/jeremypalmerio/opt/miniconda3/envs/MasterThesis
