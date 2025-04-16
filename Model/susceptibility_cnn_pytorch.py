@@ -11,6 +11,9 @@ from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from sklearn.metrics import mean_absolute_error, mean_squared_error, accuracy_score
 from sympy import primerange
 import sys
+import shap 
+import torch
+import torch.nn as nn
 
 # import tensorflow as tf
 # from tensorflow import keras
@@ -431,7 +434,7 @@ class ModelMgr:
         plt.savefig(f'Output/{region}/{self.hazard}/{name.replace(" ", "_")}.png', dpi=300)
         return fig
 
-class BaseModel:
+class BaseModel():
     def __init__(self, ModelMgr_instance):
         self.ModelMgr_instance = ModelMgr_instance
         self.name_model = 'basemodel'
@@ -500,7 +503,9 @@ class BaseModel:
         # Compile the model
         self.ModelMgr_instance.logger.info('Compiling model')
         # optimizer = Adam(learning_rate=self.learning_rate, clipnorm=1.0, epsilon=1e-7)
-        optimizer = tf.keras.optimizers.RMSprop(learning_rate=self.learning_rate, clipnorm=1.0, epsilon=1e-8) # , clipvalue=1.0
+        ## old TF: optimizer = tf.keras.optimizers.RMSprop(learning_rate=self.learning_rate, clipnorm=1.0, epsilon=1e-8) # , clipvalue=1.0
+        
+        optimizer = torch.optim.RMSprop(learning_rate=self.learning_rate, eps=1e-8) # , clipvalue=1.0
         # optimizer = tf.keras.optimizers.SGD(learning_rate=1e-5, momentum=0.9, nesterov=True, clipnorm=1.0, clipvalue=0.5)
         self.base_model.compile(optimizer=optimizer, loss=safe_binary_crossentropy, metrics=[safe_mse, safe_mae]) 
 
