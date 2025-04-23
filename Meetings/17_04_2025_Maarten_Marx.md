@@ -46,3 +46,20 @@ Wildfire example below:
 
 ### Negative vs. Hard Negative Examples
 - There is some confusion in my mind surround negative examples. Imagine a two neighboring cells that have simallar surrounding cells but different labels. Is the cell with a low likelihood label a hard negative? Should this cell be used as a negative example even though it could be a high susceptibility cell?
+
+# Maarten
+
+* It is easier to do these meeting agendas in issues, then i can add comments
+* What is the meaning (size in real life) of one cell in your large arrays?
+* I also think regression is the way to go.
+* You must find a good metric here, something that does not only count per pixel I think is much more preferred. I recall Moran's I, for spatial correlartion, but am not sure if it is re;evant.
+* The super low incidence is of course normal in this domain of predicting something extreme. That's why it is called extreme ;-) Just follow the literature, and preferably a simple, fool proof way to deal with this.
+* Train test split and data leakage: I am not an expert here. I think patches should not overlap at all.
+   * This spatial partitioning and how you give the data, and how you measure are all interconnected.
+   * My way would be 1) to follow what others have done in such a case
+   * 2) formulate hypotheses, and a "model" of how things are interrelated and influence each other.
+     3)  and use this model and these hypotheses in setting up your predictive model.
+   * Eg, one expects that neighboring cells have a strong tendency to have very similar values/classes
+* All in all, my sugegstion would be to choose a great paper in this field, and follow as much as you can of the methods of that paper in your case. These decisions are too hard for a 18 EC thesis!
+
+* 
