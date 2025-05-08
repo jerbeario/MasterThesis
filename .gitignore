@@ -178,3 +178,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+Input/Europe/partition_map/countries_rasterized.npy
+.gitignore
+
+Countries_rasterized.tif
+Sub-national_rasterized.tif
+Input/Europe/partition_map/sub_countries_rasterized.npy.DS_Store
+
+Input/Europe/partition_map/

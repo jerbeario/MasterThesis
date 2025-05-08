@@ -14,4 +14,5 @@ dependencies:
   - gdal
   - geopandas
   - rasterio
+  - torch
 prefix: /Users/jeremypalmerio/opt/miniconda3/envs/MasterThesis
