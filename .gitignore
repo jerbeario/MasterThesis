@@ -181,8 +181,10 @@ cython_debug/
 Input/Europe/partition_map/countries_rasterized.npy
 .gitignore
 
-Countries_rasterized.tif
-Sub-national_rasterized.tif
+Input/Europe/rasters/
 Input/Europe/partition_map/sub_countries_rasterized.npy.DS_Store
-
-Input/Europe/partition_map/
+Input/Europe/partition_map/balanced_partition_map_sub_countries.npy
+Input/Europe/partition_map/countries_rasterized.npy
+Input/Europe/partition_map/final_partition_map.npy
+Input/Europe/partition_map/full_balanced_partition_map_sub_countries.npy
+Input/Europe/partition_map/sub_countries_rasterized.npy
