@@ -1,6 +1,7 @@
 from scipy.ndimage import binary_erosion
 
 import numpy as np
+import sys
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -9,6 +10,11 @@ import matplotlib.colors as mcolors
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+
+import time
+from multiprocessing import Pool
+import os
+
 
 
 def create_partition_map(region: np.ndarray, mask: np.ndarray, seed: int = 42) -> np.ndarray:
@@ -73,36 +79,46 @@ def erode_partition_borders(partition_map: np.ndarray, kernel_size: int = 5) -> 
     # Set the borders to 0
     for label in [1, 2, 3]:
         border_mask = (partition_map == label) & (eroded_map != label)
-        eroded_map[border_mask] = 4
+        eroded_map[border_mask] = 0
     return eroded_map
 
-def balance_partition_map(partition_map: np.ndarray, labels: np.ndarray, countries: np.ndarray, splits = [1], seed: int = 42) -> np.ndarray:
+def balance_partition_map(partition_map: np.ndarray, labels: np.ndarray, countries: np.ndarray, seed: int = 42) -> np.ndarray:
     """
-    Downsamples negative examples within each country to match the number of positive examples.
-    Outputs a new partition map where excess negatives are set to 0 (ignored).
+    - Balances the training set (1) by downsampling negative examples to match the number of positives.
+    - Reduces the size of validation (2) and test (3) sets to 15% of the training size each,
+      while maintaining the original positive/negative ratio.
+
+    Args:
+        partition_map (np.ndarray): Partition map with values 1 (train), 2 (val), 3 (test).
+        labels (np.ndarray): Binary labels (1 = positive, 0 = negative).
+        countries (np.ndarray): Country codes for each pixel.
+        seed (int): Random seed for reproducibility.
+
+    Returns:
+        np.ndarray: Balanced partition map.
     """
-    print("Balancing partition map...")
     np.random.seed(seed)
-    balanced_map = partition_map.copy()
-    
-    for split in splits:
-        print(f"Processing split {split}...")
+    balanced_map = partition_map
+
+    # 1. Process the training set (1) - Balance positive and negative samples
+    for split in [1]:
+        print(f"Processing split {split} (Training)...")
         country_ids = np.unique(countries[partition_map == split])
-        
+
         for cid in country_ids:
-            print(f"Processing country {cid}...")
             mask = (partition_map == split) & (countries == cid)
             pos_inds = np.argwhere(mask & (labels == 1))
             neg_inds = np.argwhere(mask & (labels == 0))
             
             if len(pos_inds) == 0 or len(neg_inds) == 0:
-                # If no positives or no negatives, skip this region
+                # No positives or no negatives, skip
                 balanced_map[mask & (labels == 0)] = 0
                 continue
 
             # Downsample negatives to match number of positives
             if len(neg_inds) > len(pos_inds):
                 selected_neg_inds = neg_inds[np.random.choice(len(neg_inds), size=len(pos_inds), replace=False)]
+                # Create masks
                 all_neg_mask = np.zeros_like(mask, dtype=bool)
                 all_neg_mask[tuple(neg_inds.T)] = True
                 keep_mask = np.zeros_like(mask, dtype=bool)
@@ -110,7 +126,55 @@ def balance_partition_map(partition_map: np.ndarray, labels: np.ndarray, countri
                 discard_mask = all_neg_mask & ~keep_mask
                 balanced_map[discard_mask] = 0
 
+    # 2. Determine target sizes for val/test (15% of training size each)
+    n_train = np.sum(balanced_map == 1)
+    n_total = int(n_train/0.7)
+    target_val_test_size = int(n_total * 0.15)
+
+    # 3. Process validation (2) and test (3) sets
+    for split in [2, 3]:
+        print(f"Processing split {split}...")
+        indices = np.argwhere(balanced_map == split)
+
+        # Separate positives and negatives
+        pos_inds = indices[labels[indices[:, 0], indices[:, 1]] == 1]
+        neg_inds = indices[labels[indices[:, 0], indices[:, 1]] == 0]
+
+        # Calculate desired sample sizes while maintaining the original ratio
+        total_samples = len(pos_inds) + len(neg_inds)
+        pos_ratio = len(pos_inds) / total_samples if total_samples > 0 else 0
+        num_pos = int(target_val_test_size * pos_ratio)
+        num_neg = target_val_test_size - num_pos
+
+        # Ensure we don't exceed available samples
+        num_pos = min(num_pos, len(pos_inds))
+        num_neg = min(num_neg, len(neg_inds))
+
+        # Random sampling
+        selected_pos_inds = pos_inds[np.random.choice(len(pos_inds), size=num_pos, replace=False)]
+        selected_neg_inds = neg_inds[np.random.choice(len(neg_inds), size=num_neg, replace=False)]
+
+        # Create discard mask
+        all_pos_mask = np.zeros_like(balanced_map, dtype=bool)
+        all_neg_mask = np.zeros_like(balanced_map, dtype=bool)
+        all_pos_mask[tuple(pos_inds.T)] = True
+        all_neg_mask[tuple(neg_inds.T)] = True
+
+        keep_pos_mask = np.zeros_like(balanced_map, dtype=bool)
+        keep_neg_mask = np.zeros_like(balanced_map, dtype=bool)
+        keep_pos_mask[tuple(selected_pos_inds.T)] = True
+        keep_neg_mask[tuple(selected_neg_inds.T)] = True
+
+        discard_pos_mask = all_pos_mask & ~keep_pos_mask
+        discard_neg_mask = all_neg_mask & ~keep_neg_mask
+
+        # Apply discard mask
+        balanced_map[discard_pos_mask | discard_neg_mask] = 0
+
+    print(f"Final counts - Train: {np.sum(balanced_map == 1)}, Val: {np.sum(balanced_map == 2)}, Test: {np.sum(balanced_map == 3)}")
+
     return balanced_map
+
 
 def plot_npy_arrays(npy_files, npy_names, partition_map=False, debug_nans=False, log=False, downsample_factor=1, save_path=None):
     """
@@ -224,8 +288,10 @@ def plot_npy_arrays(npy_files, npy_names, partition_map=False, debug_nans=False,
             plt.savefig(save_path, dpi=1000, bbox_inches='tight')
 
 if __name__ == "__main__":
-
+    
+    start_time = time.time()
     seed = 42
+
     # countries = np.load("Input/Europe/partition_map/countries_rasterized.npy")
     sub_countries = np.load("Input/Europe/partition_map/sub_countries_rasterized.npy")
     wildfires = np.load("Input/Europe/npy_arrays/masked_wildfire_Europe.npy")
@@ -233,12 +299,19 @@ if __name__ == "__main__":
     
     wildfires[wildfires > 0] = 1
 
+
+
     partition_map = create_partition_map(sub_countries, elevation, seed=seed)
-    eroded_map = erode_partition_borders(partition_map, kernel_size=5)
-    full_balanced_partition_map = balance_partition_map(eroded_map, wildfires, sub_countries, seed=seed)
+    partition_map = erode_partition_borders(partition_map, kernel_size=5)
+    # partition_map = balance_partition_map(partition_map, wildfires, sub_countries, seed=seed)
+    
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
 
-    np.save("Input/Europe/partition_map/final_partition_map.npy", full_balanced_partition_map)
-    plot_npy_arrays(full_balanced_partition_map, "Partition", partition_map=True, downsample_factor=1, save_path="Input/Europe/partition_map/final_partition_map.png")
+    print(f"Elapsed time: {elapsed_time:.2f} seconds")
+    np.save("Input/Europe/partition_map/partition_map.npy", partition_map)
+    plot_npy_arrays(partition_map, "Partition", partition_map=True, downsample_factor=1, save_path="Input/Europe/partition_map/partition_map.png")
 
-
+   
 

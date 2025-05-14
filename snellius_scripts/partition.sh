@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH -t 2:00:00
-#SBATCH -n 2
+#SBATCH -n 1
 #SBATCH -p rome
 
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=jeremy.palmerio@student.uva.nl
-#SBATCH --mem=20G
+#SBATCH --mem=60G
 
 
 

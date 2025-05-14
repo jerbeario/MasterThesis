@@ -6,9 +6,14 @@ import numpy as np
 import pandas as pd
 import os
 import random
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder
-from sklearn.metrics import mean_absolute_error, mean_squared_error, accuracy_score
+# from sklearn.model_selection import train_test_split
+# from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+# from sklearn.metrics import mean_absolute_error, mean_squared_error, accuracy_score
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, 
+    roc_auc_score, confusion_matrix, precision_recall_curve, 
+    average_precision_score, roc_curve
+    )
 import sys
 import time
 import torch
@@ -23,6 +28,7 @@ import wandb
 import seaborn as sns
 
 
+# This class is finished and ready to be used
 class HazardDataset(Dataset):
     def __init__(self, hazard, variables, patch_size=5):
         """
@@ -33,12 +39,12 @@ class HazardDataset(Dataset):
         - patch_size (int): The size of the patch (n x n) around the center cell.
         """
         self.hazard = hazard.lower()
-        print(f"Loading {self.hazard} dataset...")
         self.patch_size = patch_size
         self.variables = variables
         self.num_vars = len(variables)
 
         # Define the feature file paths for each hazard
+
         self.var_paths = {
             "soil_moisture_root" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_soil_moisture_root_Europe.npy",
             "soil_moisture_surface" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_soil_moisture_surface_Europe.npy",
@@ -83,6 +89,7 @@ class HazardDataset(Dataset):
 
         # Load features (stacked along the first axis for channels)
         self.features = np.stack([np.load(path) for path in self.feature_paths], axis=0)
+        self.features = np.nan_to_num(self.features, nan=0.0)  # Handle NaN values
 
         # Load labels
         self.labels = np.load(self.label_path)
@@ -122,11 +129,13 @@ class HazardDataset(Dataset):
         - patch (torch.Tensor): The n x n patch of features.
         - label (torch.Tensor): The label for the center cell of the patch.
         """
+
         # Convert 1D index to 2D spatial index
         h, w = self.labels.shape
         row, col = divmod(idx, w)
 
         # Extract the patch centered at (row, col)
+        
         patch = self.features[:, row:row + self.patch_size, col:col + self.patch_size]
         # Get the label for the center cell
         label = self.labels[row, col]
@@ -138,10 +147,376 @@ class HazardDataset(Dataset):
         patch = patch.view(self.num_vars, self.patch_size, self.patch_size)
         
         return patch, label
-    
 
+
+# Custom balanced batch sampler
+class BalancedBatchSampler:
+    """Samples batches ensuring positive/negative balance for large datasets."""
+    def __init__(self, labels, batch_size):
+        self.pos_indices = np.where(labels == 1)[0]
+        self.neg_indices = np.where(labels == 0)[0]
+        self.batch_size = batch_size
+        
+    def __iter__(self):
+        # Shuffle indices each epoch
+        np.random.shuffle(self.pos_indices)
+        np.random.shuffle(self.neg_indices)
+        
+        # Create balanced batches
+        pos_per_batch = self.batch_size // 2
+        neg_per_batch = self.batch_size - pos_per_batch
+        
+        # Number of complete batches we can make
+        n_pos_batches = len(self.pos_indices) // pos_per_batch
+        n_neg_batches = len(self.neg_indices) // neg_per_batch
+        n_batches = min(n_pos_batches, n_neg_batches)
+        
+        for i in range(n_batches):
+            pos_batch = self.pos_indices[i*pos_per_batch:(i+1)*pos_per_batch]
+            neg_batch = self.neg_indices[i*neg_per_batch:(i+1)*neg_per_batch]
+            batch = np.concatenate([pos_batch, neg_batch])
+            np.random.shuffle(batch)  # Shuffle within batch
+            yield batch.tolist()
+            
+    def __len__(self):
+        return min(len(self.pos_indices) // (self.batch_size // 2), 
+                  len(self.neg_indices) // (self.batch_size - self.batch_size // 2))
+
+# MLP to test 1d data 
+class MLP(nn.Module):
+    def __init__(self, logger, device, num_vars, n_layers=2, n_nodes=128, 
+                 dropout=True, drop_value=0.4, patch_size=1):
+        """
+        MLP architecture designed to take feature vectors as input.
+        
+        Args:
+            logger: Logger instance
+            device: Torch device
+            num_vars: Number of input variables/features
+            n_layers: Number of hidden layers
+            n_nodes: Number of nodes in each hidden layer
+            dropout: Whether to use dropout
+            drop_value: Dropout probability
+            patch_size: Should be 1 for pure feature vector input
+        """
+        super(MLP, self).__init__()
+        
+        self.logger = logger
+        self.device = device
+        self.num_vars = num_vars
+        
+        # For feature vector input, input size is just num_vars
+        # (when patch_size=1, we get features only with no spatial context)
+        input_size = num_vars
+        if patch_size > 1:
+            # If using patches, flatten them
+            input_size = num_vars * patch_size * patch_size
+            self.logger.warning(f"Using MLP with patch_size={patch_size}. "
+                               f"Consider using patch_size=1 for feature vectors.")
+        
+        # Build the MLP layers
+        layers = []
+        
+        # Input layer
+        layers.append(nn.Linear(input_size, n_nodes))
+        layers.append(nn.BatchNorm1d(n_nodes))
+        layers.append(nn.ReLU())
+        if dropout:
+            layers.append(nn.Dropout(drop_value))
+        
+        # Hidden layers
+        for _ in range(n_layers - 1):
+            layers.append(nn.Linear(n_nodes, n_nodes))
+            layers.append(nn.BatchNorm1d(n_nodes))
+            layers.append(nn.ReLU())
+            if dropout:
+                layers.append(nn.Dropout(drop_value))
+        
+        # Output layer
+        layers.append(nn.Linear(n_nodes, 1))
+        layers.append(nn.Sigmoid())
+        
+        self.model = nn.Sequential(*layers)
+        
+        self.logger.info(f"Created MLP with {n_layers} layers, {n_nodes} nodes per layer")
+        self.logger.info(f"Input size: {input_size}, Output size: 1")
+    
+    def forward(self, x):
+        """
+        Forward pass through the MLP.
+        
+        Args:
+            x: Input tensor of shape [batch_size, num_vars, patch_size, patch_size]
+            
+        Returns:
+            Output tensor of shape [batch_size, 1]
+        """
+        # Reshape input based on whether it's a single feature vector or patches
+        batch_size = x.size(0)
+        
+        if x.size(2) == 1 and x.size(3) == 1:
+            # We have feature vectors [batch_size, num_vars, 1, 1]
+            # Reshape to [batch_size, num_vars]
+            x = x.view(batch_size, self.num_vars)
+        else:
+            # We have patches, so flatten them
+            x = x.view(batch_size, -1)
+        
+        # Forward pass through the model
+        return self.model(x)
+
+# Simple CNN architecture to test the pipeline
+class SimpleCNN(nn.Module):
+    def __init__(self, logger, device, num_vars, filters=16, dropout=False, 
+                 drop_value=0.2, patch_size=5):
+        """
+        Simple CNN architecture for hazard susceptibility modeling.
+        
+        Args:
+            logger: Logger instance
+            device: Torch device
+            num_vars: Number of input variables/channels
+            filters: Number of filters in each convolution
+            dropout: Whether to use dropout
+            drop_value: Dropout probability
+            patch_size: Size of the input neighborhood
+        """
+        super(SimpleCNN, self).__init__()
+        
+        self.logger = logger
+        self.device = device
+        self.num_vars = num_vars
+        
+        # Process each variable with a single conv layer
+        self.feature_extractors = nn.ModuleList([
+            nn.Conv2d(1, filters, kernel_size=3, padding=1)
+            for _ in range(num_vars)
+        ])
+        
+        # Shared layers after concatenation
+        self.conv = nn.Conv2d(filters * num_vars, filters * 2, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Calculate the size after pooling
+        pooled_size = patch_size // 2
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(filters * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(drop_value) if dropout else nn.Identity(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        # Split input by variables
+        var_inputs = [x[:, i:i+1] for i in range(self.num_vars)]
+        
+        # Extract features from each variable
+        features = []
+        for i, (extractor, var_input) in enumerate(zip(self.feature_extractors, var_inputs)):
+            features.append(extractor(var_input))
+        
+        # Concatenate all features
+        x = torch.cat(features, dim=1)
+        
+        # Shared processing
+        x = self.conv(x)
+        x = F.relu(x)
+        x = self.pool(x)
+        
+        # Global pooling and classification
+        x = self.global_pool(x)
+        x = self.classifier(x)
+        
+        return x
+
+# UNet architecture for hazard susceptibility modeling
+class UNet(nn.Module):
+    def __init__(self, logger, device, num_vars, filters=64, n_layers=4, activation=nn.ReLU(), 
+                 dropout=True, drop_value=0.3, kernel_size=3, pool_size=2, patch_size=5):
+        """
+        UNet architecture for hazard susceptibility modeling.
+        
+        Args:
+            logger: Logger instance
+            device: Torch device
+            num_vars: Number of input variables/channels
+            filters: Base number of filters (will be doubled in each layer)
+            n_layers: Number of downsampling/upsampling layers
+            activation: Activation function
+            dropout: Whether to use dropout
+            drop_value: Dropout probability
+            kernel_size: Kernel size for convolutions
+            pool_size: Pooling size for downsampling
+            patch_size: Size of the input neighborhood
+        """
+        super(UNet, self).__init__()
+        
+        self.logger = logger
+        self.device = device
+        self.num_vars = num_vars
+        self.filters = filters
+        self.n_layers = n_layers
+        self.activation = activation
+        self.dropout = dropout
+        self.drop_value = drop_value
+        self.kernel_size = kernel_size
+        self.pool_size = pool_size
+        self.patch_size = patch_size
+        
+        self.logger.info(f"Initializing UNet with {num_vars} input variables and {n_layers} layers")
+        
+        # Input layer: Process each variable separately
+        self.var_blocks = nn.ModuleList()
+        for _ in range(self.num_vars):
+            # Initial preprocessing for each variable
+            self.var_blocks.append(nn.Sequential(
+                nn.Conv2d(1, filters, kernel_size=kernel_size, padding='same'),
+                nn.BatchNorm2d(filters),
+                activation,
+                nn.Conv2d(filters, filters, kernel_size=kernel_size, padding='same'),
+                nn.BatchNorm2d(filters),
+                activation
+            ))
+        
+        # Feature fusion layer
+        self.fusion = nn.Conv2d(filters * num_vars, filters, kernel_size=1)
+        
+        # Encoder blocks
+        self.enc_blocks = nn.ModuleList()
+        self.pool_blocks = nn.ModuleList()
+        current_filters = filters
+        
+        for i in range(n_layers):
+            next_filters = current_filters * 2
+            self.enc_blocks.append(nn.Sequential(
+                nn.Conv2d(current_filters, next_filters, kernel_size, padding='same'),
+                nn.BatchNorm2d(next_filters),
+                activation,
+                nn.Conv2d(next_filters, next_filters, kernel_size, padding='same'),
+                nn.BatchNorm2d(next_filters),
+                activation
+            ))
+            self.pool_blocks.append(nn.MaxPool2d(pool_size))
+            current_filters = next_filters
+        
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(current_filters, current_filters * 2, kernel_size, padding='same'),
+            nn.BatchNorm2d(current_filters * 2),
+            activation,
+            nn.Conv2d(current_filters * 2, current_filters * 2, kernel_size, padding='same'),
+            nn.BatchNorm2d(current_filters * 2),
+            activation,
+            nn.Dropout2d(drop_value) if dropout else nn.Identity()
+        )
+        
+        # Decoder blocks
+        self.up_blocks = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        current_filters = current_filters * 2
+        
+        for i in range(n_layers):
+            next_filters = current_filters // 2
+            self.up_blocks.append(nn.Sequential(
+                nn.ConvTranspose2d(current_filters, next_filters, kernel_size=pool_size, 
+                                stride=pool_size, padding=0),
+                nn.BatchNorm2d(next_filters),
+                activation
+            ))
+            self.dec_blocks.append(nn.Sequential(
+                nn.Conv2d(current_filters, next_filters, kernel_size, padding='same'),
+                nn.BatchNorm2d(next_filters),
+                activation,
+                nn.Conv2d(next_filters, next_filters, kernel_size, padding='same'),
+                nn.BatchNorm2d(next_filters),
+                activation
+            ))
+            current_filters = next_filters
+        
+        # Classification head
+        # Calculate the output size based on input neighborhood and operations
+        patch_size = patch_size
+        final_size = patch_size // (pool_size ** n_layers) if patch_size % (pool_size ** n_layers) == 0 else 1
+        
+        self.classification_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),  # Global average pooling
+            nn.Flatten(),
+            nn.Linear(filters, 256),
+            nn.BatchNorm1d(256),
+            activation,
+            nn.Dropout(drop_value) if dropout else nn.Identity(),
+            nn.Linear(256, 64),
+            nn.BatchNorm1d(64),
+            activation,
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, x):
+        """Forward pass of the UNet model."""
+        # Split input into separate variable channels
+        var_inputs = [x[:, i:i+1] for i in range(self.num_vars)]
+        
+        # Process each variable through its own block
+        var_features = []
+        for i, (block, inp) in enumerate(zip(self.var_blocks, var_inputs)):
+            var_features.append(block(inp))
+        
+        # Concatenate and fuse features from all variables
+        x = torch.cat(var_features, dim=1)
+        x = self.fusion(x)
+        
+        # Store encoder outputs for skip connections
+        enc_features = []
+        
+        # Encoder path
+        for enc_block, pool_block in zip(self.enc_blocks, self.pool_blocks):
+            # Save output before pooling for skip connection
+            enc_features.append(x)
+            # Apply convolution block then pooling
+            x = enc_block(x)
+            x = pool_block(x)
+        
+        # Bottleneck
+        x = self.bottleneck(x)
+        
+        # Decoder path with skip connections
+        for i, (up_block, dec_block) in enumerate(zip(self.up_blocks, self.dec_blocks)):
+            # Upsample
+            x = up_block(x)
+            
+            # Get corresponding encoder feature map
+            skip_feature = enc_features[-(i+1)]
+            
+            # Handle size mismatch (if any)
+            if x.shape != skip_feature.shape:
+                # Center crop or pad to match
+                diff_h = skip_feature.size(2) - x.size(2)
+                diff_w = skip_feature.size(3) - x.size(3)
+                
+                if diff_h > 0 and diff_w > 0:
+                    skip_feature = skip_feature[:, :, diff_h//2:-(diff_h//2), diff_w//2:-(diff_w//2)]
+                elif diff_h < 0 and diff_w < 0:
+                    padding = [-diff_h//2, -diff_h-(-diff_h//2), -diff_w//2, -diff_w-(-diff_w//2)]
+                    skip_feature = F.pad(skip_feature, padding)
+            
+            # Concatenate for skip connection
+            x = torch.cat([x, skip_feature], dim=1)
+            
+            # Apply convolution block
+            x = dec_block(x)
+        
+        # Final classification
+        outputs = self.classification_head(x)
+        return torch.sigmoid(outputs)
+
+# CNN architecture for hazard susceptibility modeling
 class CNN(nn.Module):
-    def __init__(self, logger, device, num_vars, filters, n_layers, activation, dropout, drop_value, kernel_size, pool_size, neighborhood_size):
+    def __init__(self, logger, device, num_vars, filters, n_layers, activation, dropout, drop_value, kernel_size, pool_size, patch_size):
         super(CNN, self).__init__()
         self.logger = logger
         self.device = device
@@ -153,7 +528,7 @@ class CNN(nn.Module):
         self.drop_value = drop_value
         self.kernel_size = kernel_size
         self.pool_size = pool_size
-        self.neighborhood_size = neighborhood_size
+        self.patch_size = patch_size
 
         # Define variable-specific blocks
         self.var_blocks = nn.ModuleList()
@@ -212,73 +587,613 @@ class CNN(nn.Module):
         # self.logger.info(f"After sigmoid: {x.shape}")
         return x
     
-    import torch.utils
-
 
 class BaseModel():
-    def __init__(self, device, hazard, region, 
-                 variables, neighborhood_size, train_loader, val_loader, logger, seed):
+    def __init__(self, device, hazard, region, variables, patch_size, batch_size, model_architecture, 
+                 logger, seed, use_wandb, sample_size, num_workers, early_stopping, patience, min_delta):
         super(BaseModel, self).__init__()
+        self.use_wandb = use_wandb
         self.logger = logger
         self.device = device
         self.hazard = hazard
         self.region = region
-        self.neighborhood_size = neighborhood_size
+        self.batch_size = batch_size
+        self.patch_size = patch_size
         self.num_vars = len(variables)
         self.variables = variables
         self.seed = seed
-        self.name_model = 'wildfire'
+        self.name_model = hazard + '_' + region + '_base_model'
 
+        self.model_architecture = model_architecture
 
         # Data
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        # self.test_loader = ModelMgr_instance.test_loader
-        
-    
+        self.num_workers = num_workers # number of workers for data loading
+        self.sample_size = sample_size # fraction of the dataset to use for training
+        self.train_loader, self.val_loader, self.test_loader = self.load_dataset()
         
         # Hyperparameters
         self.learning_rate = 0.0001
-        self.filters = 32
+        self.filters = 16
         self.n_layers = 3
         self.drop_value = 0.41
         self.kernel_size = 3
         self.pool_size = 2  
         self.activation = torch.nn.ReLU()
         self.dropout = True
+        self.n_nodes = 128
 
-        
+        # Training
+        self.epochs = 100
+        self.early_stopping = early_stopping
+        self.patience = patience
+        self.min_delta = min_delta
 
-
+        # WandB 
+        if self.use_wandb:
+            wandb.init(
+                    project=f"{hazard}_susceptibility",
+                    name=f"{self.model_architecture}_base_model",
+                    config={
+                        "hazard": self.hazard,
+                        "region": self.region,
+                        "batch_size": self.batch_size,
+                        "patch_size": self.patch_size,
+                        "variables": self.variables,
+                        "learning_rate": self.learning_rate,
+                        "filters": self.filters,
+                        "n_layers": self.n_layers,
+                        "dropout": self.dropout,
+                        "model_type": self.model_architecture 
+                    }
+                )
 
         # Build the CNN architecture
-        self.model = self.design_basemodel()
+        self.model = self.design_basemodel(architecture=self.model_architecture)
         self.model.to(self.device)
         # self.logger.info(f"fi:{self.filters} ly:{self.n_layers} dv:{self.drop_value} lr:{self.learning_rate}")
 
-    def design_basemodel(self):
+    def design_basemodel(self, architecture='CNN'):
         """
         Define the CNN architecture in PyTorch.
         """
         self.logger.info('Building architecture')
-        model = CNN(
-            logger=self.logger,
-            device=self.device,
-            num_vars=self.num_vars,
-            filters=self.filters,
-            n_layers=self.n_layers,
-            activation=self.activation,
-            dropout=self.dropout,
-            drop_value=self.drop_value,
-            kernel_size=self.kernel_size,
-            pool_size=self.pool_size,
-            neighborhood_size=self.neighborhood_size
-        )
+        if architecture == 'MLP':
+            self.logger.info('Using MLP architecture')
+            model = MLP(
+                logger=self.logger,
+                device=self.device,
+                num_vars=self.num_vars,
+                n_layers=self.n_layers,
+                n_nodes=self.n_nodes, 
+                dropout=self.dropout,
+                drop_value=self.drop_value,
+                patch_size=self.patch_size
+            )
 
-    
-
+        elif architecture == 'CNN':
+            self.logger.info('Using CNN architecture')
+            model = CNN(
+                logger=self.logger,
+                device=self.device,
+                num_vars=self.num_vars,
+                filters=self.filters,
+                n_layers=self.n_layers,
+                activation=self.activation,
+                dropout=self.dropout,
+                drop_value=self.drop_value,
+                kernel_size=self.kernel_size,
+                pool_size=self.pool_size,
+                patch_size=self.patch_size
+            )
+        elif architecture == 'UNet':
+            self.logger.info('Using UNet architecture')
+            model = UNet(
+                logger=self.logger,
+                device=self.device,
+                num_vars=self.num_vars,
+                filters=self.filters,
+                n_layers=self.n_layers,
+                activation=self.activation,
+                dropout=self.dropout,
+                drop_value=self.drop_value,
+                kernel_size=self.kernel_size,
+                pool_size=self.pool_size,
+                patch_size=self.patch_size
+            )
+        elif architecture == 'SimpleCNN':
+            self.logger.info('Using SimpleCNN architecture')
+            model = SimpleCNN(
+                logger=self.logger,
+                device=self.device,
+                num_vars=self.num_vars,
+                filters=self.filters,
+                dropout=self.dropout,
+                drop_value=self.drop_value,
+                patch_size=self.patch_size
+            )
 
         return model
+    
+    def load_dataset(self):
+        """
+        
+        Preprocess the data for the model, using the dataset class.
+
+        """
+        
+        # loading partition map 
+        # TODO generalize for other hazard partition maps
+        self.logger.info('Loading partition map')
+        partition_map = np.load(f'Input/{self.region}/partition_map/partition_map.npy')
+        partition_shape = partition_map.shape
+
+        dataset = HazardDataset(hazard=self.hazard, variables=self.variables, patch_size=self.patch_size)
+        
+        idx_transform = np.array([[partition_shape[1]],[1]])
+
+        train_indices = (np.argwhere(partition_map == 1) @ idx_transform).flatten()
+        val_indices = (np.argwhere(partition_map == 2) @ idx_transform).flatten()
+        test_indices = (np.argwhere(partition_map == 3) @ idx_transform).flatten()
+
+        np.random.shuffle(train_indices)
+        np.random.shuffle(val_indices)
+        np.random.shuffle(test_indices)
+
+        train_indices = train_indices[:int(len(train_indices) * self.sample_size)]
+        val_indices = val_indices[:int(len(val_indices) * self.sample_size)]
+        test_indices = test_indices[:int(len(test_indices) * self.sample_size)]
+
+        train_dataset = Subset(dataset, train_indices)
+        val_dataset = Subset(dataset, val_indices)
+        test_dataset = Subset(dataset, test_indices)
+
+        # Get labels for the subset
+        train_labels = dataset.labels.flatten()[train_indices]
+
+        # Create custom balanced batch sampler
+        batch_sampler = BalancedBatchSampler(train_labels, self.batch_size)
+
+        # Create DataLoader with the custom batch sampler
+        train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_sampler=batch_sampler)
+        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+
+        self.logger.info(f"Train dataset size: {len(train_dataset)}")
+        self.logger.info(f"Validation dataset size: {len(val_dataset)}")
+        self.logger.info(f"Test dataset size: {len(test_dataset)}")
+
+        # Create DataLoaders for training and validation
+
+        return train_loader, val_loader, test_loader
+
+    def train(self):
+        """
+        Train the model using the provided data loaders.
+        """
+        self.logger.info(f'Training the mode with :{len(self.train_loader)*self.batch_size} samples ')
+        self.logger.info(f"Training with {self.num_vars} variables, {self.batch_size} batch size, and {self.patch_size} neighborhood size")
+        if self.use_wandb:
+            wandb.watch(self.model, log="all")
+
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        # optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate)
+        best_val_loss = float('inf')
+        best_model_state = None
+        epoch_without_improvement = 0
+        
+        for epoch in range(self.epochs):
+            self.model.train()
+            train_loss = 0.0
+            train_accuracy = 0.0
+
+            for inputs, labels in self.train_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                # Reshape Labels to match output 
+                labels = labels.unsqueeze(1)
+
+                # Forward pass
+                outputs = self.model(inputs)
+                loss = F.binary_cross_entropy(outputs, labels)
+                accuracy = self.safe_accuracy(labels, outputs)
+
+                
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+
+                # Step the optimizer
+                optimizer.step()
+
+                train_loss += loss.item()
+                train_accuracy += accuracy.item()
+
+            
+            # Calculate average metrics
+            train_loss /= len(self.train_loader)
+            train_accuracy /= len(self.train_loader)
+
+            
+            # Evaluate on validation data
+            val_loss, val_accuracy = self.evaluate(self.val_loader)
+
+            self.logger.info(f"Epoch {epoch+1}/{self.epochs}")
+            self.logger.info(f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
+            self.logger.info(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
+
+            # Save the best model
+            if val_loss < best_val_loss - self.min_delta:
+                best_val_loss = val_loss
+                torch.save(self.model.state_dict(), f"{self.name_model}_best.pth")
+                best_model_state = self.model.state_dict().copy()
+                epochs_without_improvement = 0
+                self.logger.info(f"  New best model saved (lowest validation loss)")
+            else:
+                epochs_without_improvement += 1
+                self.logger.info(f"  No improvement for {epochs_without_improvement} epochs")
+                
+                # Early stopping check
+                if self.early_stopping and epochs_without_improvement >= self.patience:
+                    self.logger.info(f"Early stopping triggered after {epoch+1} epochs")
+                    break
+
+
+            # Log metrics to wandb
+            if self.use_wandb:
+                wandb.log({
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_accuracy": train_accuracy,
+                    "val_loss": val_loss,
+                    "val_accuracy": val_accuracy,
+                    "learning_rate": self.learning_rate
+                })
+        
+    def evaluate(self, data_loader):
+        """
+        Evaluate the model on the provided data loader.
+        
+        Returns:
+            Tuple of (loss, accuracy, f1)
+        """
+        self.model.eval()
+        val_loss = 0.0
+        val_accuracy = 0.0
+
+
+        with torch.no_grad():
+            self.logger.info(f'Evaluating the model with :{len(data_loader)*self.batch_size} samples ')
+            for inputs, labels in data_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                labels = labels.unsqueeze(1)
+
+                # Forward pass
+                outputs = self.model(inputs)
+                
+                # Calculate metrics
+                # loss = self.safe_binary_crossentropy(labels, outputs)
+                loss = F.binary_cross_entropy(outputs, labels)
+
+                accuracy = self.safe_accuracy(labels, outputs)
+
+
+                
+                val_loss += loss.item()
+                val_accuracy += accuracy.item()
+
+
+        # Calculate average metrics
+        val_loss /= len(data_loader)
+        val_accuracy /= len(data_loader)
+        
+        return val_loss, val_accuracy
+
+    def predict(self, test_loader):
+        """
+        Make predictions using the trained model.
+        """
+        self.model.eval()
+        predictions = []
+
+        with torch.no_grad():
+            for inputs in test_loader:
+                inputs = inputs.to(self.device)
+                outputs = self.model(inputs)
+                predictions.append(outputs.cpu().numpy())
+
+        return np.concatenate(predictions)
+        
+    def testing(self):
+        """
+        Thoroughly test the model on the test dataset and output comprehensive metrics.
+        """
+        self.logger.info('Starting comprehensive model testing')
+        self.model.eval()
+        
+        # Collect all predictions and ground truth
+        y_true = []
+        y_pred = []
+        y_prob = []
+        
+        with torch.no_grad():
+            for inputs, labels in self.test_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                outputs = self.model(inputs)
+                
+                # Store predictions and labels
+                y_true.extend(labels.cpu().numpy())
+                y_prob.extend(outputs.cpu().numpy())
+                y_pred.extend((outputs > 0.5).cpu().numpy())
+        
+        # Convert to numpy arrays for easier manipulation
+        y_true = np.array(y_true)
+        y_prob = np.array(y_prob)
+        y_pred = np.array(y_pred)
+        
+       
+        
+        # Basic metrics
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        
+        # AUC metrics
+        try:
+            auc_roc = roc_auc_score(y_true, y_prob)
+            avg_precision = average_precision_score(y_true, y_prob)
+        except ValueError:
+            self.logger.warning("Could not calculate AUC metrics - possibly only one class present in test set")
+            auc_roc = np.nan
+            avg_precision = np.nan
+        
+        # Calculate confusion matrix
+        cm = confusion_matrix(y_true, y_pred)
+        
+        # Log metrics
+        self.logger.info(f"Test Results for {self.hazard} {self.model_architecture} model:")
+        self.logger.info(f"  Accuracy: {accuracy:.4f}")
+        self.logger.info(f"  Precision: {precision:.4f}")
+        self.logger.info(f"  Recall: {recall:.4f}")
+        self.logger.info(f"  F1 Score: {f1:.4f}")
+        self.logger.info(f"  AUC-ROC: {auc_roc:.4f}")
+        self.logger.info(f"  Average Precision: {avg_precision:.4f}")
+        self.logger.info(f"  Confusion Matrix: \n{cm}")
+        
+        # Calculate class imbalance
+        class_counts = np.bincount(y_true.astype(int).flatten())
+        class_proportions = class_counts / np.sum(class_counts)
+        self.logger.info(f"  Class distribution: {class_counts}, {class_proportions}")
+        
+        # Generate visualizations
+        # 1. Confusion matrix
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=['Negative', 'Positive'], 
+                    yticklabels=['Negative', 'Positive'])
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title(f'{self.hazard} {self.model_architecture} Confusion Matrix')
+        plt.tight_layout()
+        plt.savefig(f'{self.name_model}_confusion_matrix.png')
+        
+        # 2. ROC curve
+        if not np.isnan(auc_roc):
+            plt.figure(figsize=(8, 6))
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            plt.plot(fpr, tpr, label=f'AUC = {auc_roc:.4f}')
+            plt.plot([0, 1], [0, 1], 'k--')
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title(f'{self.hazard} {self.model_architecture} ROC Curve')
+            plt.legend()
+            plt.savefig(f'{self.name_model}_roc_curve.png')
+        
+        # 3. Precision-Recall curve
+        if not np.isnan(avg_precision):
+            plt.figure(figsize=(8, 6))
+            precision_curve, recall_curve, _ = precision_recall_curve(y_true, y_prob)
+            plt.plot(recall_curve, precision_curve, label=f'AP = {avg_precision:.4f}')
+            # Add baseline based on class imbalance
+            baseline = class_proportions[1] if len(class_proportions) > 1 else 0
+            plt.axhline(y=baseline, color='r', linestyle='--', label=f'Baseline = {baseline:.4f}')
+            plt.xlabel('Recall')
+            plt.ylabel('Precision')
+            plt.title(f'{self.hazard} {self.model_architecture} Precision-Recall Curve')
+            plt.legend()
+            plt.savefig(f'{self.name_model}_pr_curve.png')
+        
+        # Save metrics to CSV
+        metrics_dict = {
+            'Model': [self.model_architecture],
+            'Hazard': [self.hazard],
+            'Accuracy': [accuracy],
+            'Precision': [precision],
+            'Recall': [recall],
+            'F1': [f1],
+            'AUC-ROC': [auc_roc],
+            'Avg_Precision': [avg_precision],
+            'Class_0_Count': [class_counts[0]],
+            'Class_1_Count': [class_counts[1] if len(class_counts) > 1 else 0],
+        }
+        df = pd.DataFrame(metrics_dict)
+        
+        # Create directory if it doesn't exist
+        os.makedirs(f'Output/{self.region}/{self.hazard}', exist_ok=True)
+        
+        # Save to CSV
+        df.to_csv(f'Output/{self.region}/{self.hazard}/{self.model_architecture}_test_metrics.csv', index=False)
+        
+        # Log to wandb
+        if self.use_wandb:
+            wandb.log({
+                "test_accuracy": accuracy,
+                "test_precision": precision,
+                "test_recall": recall,
+                "test_f1": f1,
+                "test_auc_roc": auc_roc,
+                "test_avg_precision": avg_precision,
+                "test_confusion_matrix": wandb.Image(f'{self.name_model}_confusion_matrix.png'),
+                "test_roc_curve": wandb.Image(f'{self.name_model}_roc_curve.png') if not np.isnan(auc_roc) else None,
+                "test_pr_curve": wandb.Image(f'{self.name_model}_pr_curve.png') if not np.isnan(avg_precision) else None,
+                "test_class_balance": wandb.plot.bar(
+                    wandb.Table(data=[[str(i), count] for i, count in enumerate(class_counts)],
+                                columns=["class", "count"]),
+                    "class", "count", title="Test Set Class Distribution"
+                )
+            })
+            
+            # Also log feature importance if available
+            if hasattr(self, 'permutation_feature_importance') and len(self.variables) <= 20:
+                self.logger.info("Calculating feature importance...")
+                try:
+                    # Get baseline score
+                    baseline_score = roc_auc_score(y_true, y_prob)
+                    
+                    # Get feature importances using a small subset for efficiency
+                    subset_size = min(5000, len(y_true))
+                    X_subset = torch.stack([batch[0] for batch in list(self.test_loader)[:subset_size//self.batch_size]])
+                    y_subset = y_true[:subset_size]
+                    
+                    feature_importances = self.permutation_feature_importance(
+                        X_subset, y_subset, baseline_score, roc_auc_score)
+                    
+                    # Log feature importances
+                    plt.figure(figsize=(10, 6))
+                    plt.barh(self.variables, feature_importances)
+                    plt.xlabel('Feature Importance')
+                    plt.ylabel('Feature')
+                    plt.title(f'{self.hazard} {self.model_architecture} Feature Importance')
+                    plt.tight_layout()
+                    plt.savefig(f'{self.name_model}_feature_importance.png')
+                    
+                    # Log to wandb
+                    wandb.log({
+                        "feature_importance": wandb.Image(f'{self.name_model}_feature_importance.png')
+                    })
+                except Exception as e:
+                    self.logger.warning(f"Could not calculate feature importance: {e}")
+        
+        self.logger.info("Comprehensive testing completed")    
+
+        # Save the model in the exchangeable ONNX format
+        if self.use_wandb:
+            save_path = f"Output/{self.region}/{self.hazard}/{self.name_model}_best.onnx"
+            self.logger.info('Saving model in ONNX format')
+            inputs = torch.randn(1, self.num_vars, self.patch_size, self.patch_size).to(self.device)
+            torch.onnx.export(self.model, inputs, save_path)
+            wandb.save(save_path)
+
+    def permutation_feature_importance(self, X, y, baseline_score, metric_fn):
+        """
+        Compute permutation feature importance.
+        """
+        feature_importances = []
+
+        for i in range(X.shape[1]):
+            X_permuted = X.clone()
+            X_permuted[:, i] = X_permuted[torch.randperm(X_permuted.size(0)), i]
+
+            permuted_score = metric_fn(y, self.predict(X_permuted))
+            importance = baseline_score - permuted_score
+            feature_importances.append(importance)
+
+        return feature_importances
+    
+    def HypParOpt(self):
+        """Hyperparameter optimization using wandb sweeps"""
+        self.logger.info("Starting hyperparameter optimization with wandb")
+        
+        # Define sweep configuration
+        sweep_config = {
+            'method': 'bayes',  # Use Bayesian optimization
+            'metric': {
+                'name': 'val_loss',
+                'goal': 'minimize'
+            },
+            'parameters': {
+                'learning_rate': {
+                    'distribution': 'log_uniform_values',
+                    'min': 0.00001,
+                    'max': 0.001
+                },
+                # 'filters': {
+                #     'values': [8, 16, 32, 64]
+                # },
+                'n_layers': {
+                    'values': [1, 2, 3, 4,]
+                },
+                'n_nodes': {
+                    'values': [16, 32, 64, 128, 256]
+                },
+                'drop_value': {
+                    'distribution': 'uniform',
+                    'min': 0.2,
+                    'max': 0.5
+                },
+                'sample_size': {
+                    'values': [0.01, 0.05, 0.1, 0.5, 1]
+                },
+            }
+        }
+        
+        # Initialize sweep
+        sweep_id = wandb.sweep(
+            sweep_config, 
+            project=f"{self.hazard}_{self.model_architecture}_sweep"
+        )
+         
+        # Start the sweep agent
+        wandb.agent(sweep_id, self.sweep_train, count=10)  # Run 10 trials
+        self.logger.info(f"Hyperparameter sweep completed with ID: {sweep_id}")
+ 
+
+    def sweep_train(self):
+        # Initialize new wandb run
+        with wandb.init() as run:
+            # Get hyperparameters from wandb config
+            config = wandb.config
+            
+            # Update model hyperparameters
+            self.learning_rate = config.learning_rate
+            # self.filters = config.filters
+            self.n_layers = config.n_layers 
+            self.n_nodes = config.n_nodes
+            self.drop_value = config.drop_value
+            # self.batch_size = config.batch_size
+            self.sample_size = config.sample_size
+            
+            # Log configuration for this run
+            self.logger.info(f"Sweep run with: lr={self.learning_rate}, "
+                        # f"filters={self.filters}, "
+                        f"n_nodes={self.n_nodes}, "
+                        f"n_layers={self.n_layers}, "
+                        f"dropout={self.drop_value}, "
+                        f"sample_size={self.sample_size}, "
+            )
+            
+            # Recreate data loaders with new batch size
+            self.train_loader, self.val_loader, self.test_loader = self.load_dataset()
+            
+            # Rebuild model with new hyperparameters
+            self.model = self.design_basemodel(architecture=self.model_architecture)
+            self.model.to(self.device)
+            
+            # Set smaller number of epochs for sweep runs
+            original_epochs = self.epochs
+            self.epochs = 20 # Reduced epochs for sweep runs
+            
+            # Use the existing training loop
+            self.train()
+            
+            # Restore original epochs
+            self.epochs = original_epochs
+            
+            # Evaluate on test set
+            test_loss, test_accuracy = self.evaluate(self.test_loader)
+            wandb.log({
+                "final_test_loss": test_loss,
+                "final_test_accuracy": test_accuracy
+            })    
 
     @staticmethod
     def safe_binary_crossentropy(y_true, y_pred):
@@ -322,8 +1237,8 @@ class BaseModel():
             Accuracy score
         """
         # Handle NaN values
-        y_pred = torch.nan_to_num(y_pred, nan=0.0)
-        y_true = torch.nan_to_num(y_true, nan=0.0)
+        # y_pred = torch.nan_to_num(y_pred, nan=0.0)
+        # y_true = torch.nan_to_num(y_true, nan=0.0)
         
         # Convert predictions to binary
         y_pred_binary = (y_pred >= threshold).float()
@@ -367,178 +1282,6 @@ class BaseModel():
         f1 = 2 * (precision * recall) / (precision + recall + epsilon)
         return f1
 
-    def train(self, epochs=10):
-        """
-        Train the model using the provided data loaders.
-        """
-        self.logger.info('Training the model')
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        best_val_loss = float('inf')
-        best_val_f1 = 0.0
-
-        for epoch in range(epochs):
-            self.logger.info(f"Epoch {epoch+1}/{epochs} starting...")
-            self.model.train()
-            train_loss = 0.0
-            train_accuracy = 0.0
-            train_f1 = 0.0
-
-            for inputs, labels in self.train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
-                # Reshape Labels to match output 
-                labels = labels.unsqueeze(1)
-                
-                # Forward pass
-                outputs = self.model(inputs)
-                loss = self.safe_binary_crossentropy(labels, outputs)
-                
-                # Calculate metrics
-                accuracy = self.safe_accuracy(labels, outputs)
-                f1 = self.safe_f1_score(labels, outputs)
-                
-                # Backward pass and optimization
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                train_loss += loss.item()
-                train_accuracy += accuracy.item()
-                train_f1 += f1.item()
-            
-            # Calculate average metrics
-            train_loss /= len(self.train_loader)
-            train_accuracy /= len(self.train_loader)
-            train_f1 /= len(self.train_loader)
-            
-            # Evaluate on validation data
-            val_loss, val_accuracy, val_f1 = self.evaluate(self.val_loader)
-
-            self.logger.info(f"Epoch {epoch+1}/{epochs}")
-            self.logger.info(f"  Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}, Train F1: {train_f1:.4f}")
-            self.logger.info(f"  Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}, Val F1: {val_f1:.4f}")
-
-            # Save the best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(self.model.state_dict(), f"{self.name_model}_best.pth")
-                self.logger.info(f"  New best model saved (lowest validation loss)")
-
-                        
-            # Save based on F1 score
-            if val_f1 > best_val_f1:
-                best_val_f1 = val_f1
-                torch.save(self.model.state_dict(), f"{self.name_model}_best_f1.pth")
-                self.logger.info(f"  New best model saved (highest validation F1)")
-
-    def evaluate(self, data_loader):
-        """
-        Evaluate the model on the provided data loader.
-        
-        Returns:
-            Tuple of (loss, accuracy, f1)
-        """
-        self.model.eval()
-        val_loss = 0.0
-        val_accuracy = 0.0
-        val_f1 = 0.0
-
-        with torch.no_grad():
-            for inputs, labels in data_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
-                labels = labels.unsqueeze(1)
-
-                # Forward pass
-                outputs = self.model(inputs)
-                
-                # Calculate metrics
-                loss = self.safe_binary_crossentropy(labels, outputs)
-                accuracy = self.safe_accuracy(labels, outputs)
-                f1 = self.safe_f1_score(labels, outputs)
-                
-                val_loss += loss.item()
-                val_accuracy += accuracy.item()
-                val_f1 += f1.item()
-
-        # Calculate average metrics
-        val_loss /= len(data_loader)
-        val_accuracy /= len(data_loader)
-        val_f1 /= len(data_loader)
-        
-        return val_loss, val_accuracy, val_f1
-
-    def predict(self, test_loader):
-        """
-        Make predictions using the trained model.
-        """
-        self.model.eval()
-        predictions = []
-
-        with torch.no_grad():
-            for inputs in test_loader:
-                inputs = inputs.to(self.device)
-                outputs = self.model(inputs)
-                predictions.append(outputs.cpu().numpy())
-
-        return np.concatenate(predictions)
-    
-    def testing(self):
-        """
-        Test the model on the test dataset.
-        """
-        # TODO rewrite this function
-
-        # # Evaluate the model on the validation data
-        # self.logger.info('Testing')
-
-
-        # y_pred = self.base_model.predict({'input_' + str(i+1): self.ModelMgr_instance.test_data[i] for i in range(len(self.ModelMgr_instance.test_data))})
-        # y_pred = np.squeeze(y_pred, axis=(1))
-        # y_true = np.squeeze(self.ModelMgr_instance.test_labels, axis=(1,2))
-
-
-        # #TODO check if torch tensor is needed
-
-        # # # Calculate Binary Cross-Entropy
-        # # y_pred_tf = tf.convert_to_tensor(y_pred, dtype=tf.float32)
-        # # y_true_tf = tf.convert_to_tensor(y_true, dtype=tf.float32)
-        # # bce = tf.keras.backend.binary_crossentropy(y_true_tf, y_pred_tf)
-        # # self.bce_test = tf.reduce_mean(bce).numpy()
-        # # self.logger.info(f"BCE: {self.bce_test}")
-
-        # # Metrics
-        # self.mae = mean_absolute_error(y_true, y_pred)
-        # self.mse = mean_squared_error(y_true, y_pred)
-        # self.logger.info(f"MAE: {self.mae}")
-        # self.logger.info(f"MSE: {self.mse}")
-
-        # # Create a dictionary to store values with names
-        # metrics_dict = {'MAE': [self.mae], 'MSE': [self.mse]}
-        # df = pd.DataFrame(metrics_dict)
-
-        # # Write the values to a text file
-        # df.to_csv(f'Output/{self.region}/{self.hazard}/config_{self.ModelMgr_instance.test}_basemodel.csv', index=False)
-
-        # # Store in W&B
-        # wandb.log({"MAE_test": self.mae})
-        # wandb.log({"MSE_test": self.mse})
-        # wandb.log({"BCE_test": self.bce_test})
-
-    def permutation_feature_importance(self, X, y, baseline_score, metric_fn):
-        """
-        Compute permutation feature importance.
-        """
-        feature_importances = []
-
-        for i in range(X.shape[1]):
-            X_permuted = X.clone()
-            X_permuted[:, i] = X_permuted[torch.randperm(X_permuted.size(0)), i]
-
-            permuted_score = metric_fn(y, self.predict(X_permuted))
-            importance = baseline_score - permuted_score
-            feature_importances.append(importance)
-
-        return feature_importances
-    
     def run(self):
         """
         Run the model training and evaluation.
@@ -553,54 +1296,36 @@ class BaseModel():
         """
         Main function to run the model training and evaluation.
         """
-        # if self.ModelMgr_instance.hyper:
-        #     self.base_model = False
-        #     if self.ModelMgr_instance.partition == 'random':
-        #         self.ModelMgr_instance.preprocess() 
-        #     wandb.init()
-        #     self.n_layers = wandb.config.layers
-        #     self.filters = wandb.config.filters
-        #     self.learning_rate = wandb.config.lr
-        #     self.drop_value = wandb.config.dropout
-
-        # Develop a basemodel
-        # self.design_basemodel()
-        # Define the optimizer
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        self.logger.info(f"Optimizer: {optimizer}")
         self.train()
-        # self.predict()
-        # self.testing()
 
-        # if self.ModelMgr_instance.hyper:
-        #     new_row = pd.DataFrame([{
-        #         "layers": wandb.config.layers,
-        #         "filters": wandb.config.filters,
-        #         "lr": wandb.config.lr,
-        #         "dropout": wandb.config.dropout,
-        #         "val_loss": self.bce_val,
-        #         "MAE": self.mae,
-        #         "MSE": self.mse,
-        #     }])
-        #     self.hyper_df = pd.concat([self.hyper_df, new_row], ignore_index=True)
-        #     self.hyper_df.to_csv(f"Output/{self.region}/{self.hazard}/Sweep_results_BaseModel_{self.ModelMgr_instance.test}.csv", index=False)
-        #     if self.bce_val < self.bce_val_best:
-        #         self.bce_val_best = self.bce_val
+        if self.use_wandb:  
+            wandb.finish(exit_code=1)
+    
         self.logger.info(f"Main done")
 
 class ModelMgr:
-    def __init__(self, region='Europe', test='Europe', prep='model', hazard='Wildfire', hyper=False, model_choice='base', partition='spatial'):
+    def __init__(self, region='Europe', batch_size=1024, patch_size=5, base_model='CNN' , sample_size = 1, 
+                test='Europe', prep='model', hazard='Wildfire', hyper=False, model_choice='base', partition='spatial', use_wandb=True):
+        
+        
+        self.early_stopping = True
+        self.patience = 5 
+        self.min_delta=0.001
+        self.use_wandb = use_wandb
         self.hazard = hazard
         self.region = region
-        self.batch_size = 32
+        self.batch_size = batch_size
         self.name_model = 'susceptibility'
         self.missing_data_value = 0
         self.sample_ratio = 0.8
         self.test_split = 0.15
-        self.neighborhood_size = 5
+        self.sample_size = sample_size
+        self.num_workers = 8
+        self.patch_size = patch_size
         self.hyper = hyper
         self.test = test
         self.model_choice = model_choice
+        self.model_architecture = base_model # 'CNN' or 'UNet' or 'SimpleCNN'
         self.partition = partition
         if self.hazard == 'Landslide':
             self.variables = ['elevation', 'slope', 'landcover', 'aspect', 'NDVI', 'precipitation', 'accuflux', 'HWSD', 'road', 'GEM', 'curvature', 'GLIM']
@@ -634,100 +1359,37 @@ class ModelMgr:
 
         self.logger, self.ch = self.set_logger()
 
-        
 
        # PyTorch GPU configuration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+        # self.device = torch.device("cpu")
         self.logger.info(f"Using device: {self.device}")
         if torch.cuda.is_available():
             self.logger.info(f"Num GPUs Available: {torch.cuda.device_count()}")
             self.logger.info(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
         self.logger.info(f"Torch version: {torch.__version__}")
-    
-        # # Configure memory growth for both GPUs to avoid memory errors
-        # for gpu in physical_devices:
-        #     tf.config.experimental.set_memory_growth(gpu, True)
-
-        # self.logger.info(f"GPU devices: {tf.config.list_physical_devices('GPU')}")
-
-        # Test simple GPU operation
-        a = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device=self.device)
-        b = torch.tensor([[5.0, 6.0], [7.0, 8.0]], device=self.device)
-        c = torch.matmul(a, b)
-        self.logger.info(f"Matrix multiplication result: {c}")
-
-        # sys.exit(0)
         
-
-        # TODO clean up dataloaders
-
-        self.train_loader, self.val_loader, self.test_loader = self.load_dataset()
-
-
-       # Load the dataset
-        # self.logger.info('Loading dataset')
-        # dataset = HazardDataset(hazard=self.hazard, patch_size=self.neighborhood_size)
-
-        # # Extract labels from the dataset
-        # labels = [dataset[i][1].item() for i in range(len(dataset))]  # Extract labels for stratified sampling
-
-        # # Perform stratified train-validation split
-        # train_indices, val_indices = train_test_split(
-        #     range(len(dataset)),
-        #     test_size=0.20,  # 20% validation
-        #     stratify=labels,  # Ensure class balance
-        #     random_state=self.seed
-        # )
-
-        # # Create subsets using the indices
-        # train_dataset = Subset(dataset, train_indices)
-        # val_dataset = Subset(dataset, val_indices)
-
-
-        # self.logger.info(f"Train dataset size before balancing: {len(train_dataset)}")
-        
-        # train_labels = [dataset[i][1].item() for i in range(len(train_dataset))]  # Extract labels for stratified sampling
-        # train_labels = np.array(train_labels).astype(np.int64)
-
-        # # Compute class weights
-        # class_counts = np.bincount(train_labels)
-        # class_weights = 1.0 / class_counts
-        # sample_weights = class_weights[train_labels]
-
-        # # Create a WeightedRandomSampler
-        # sampler = WeightedRandomSampler(
-        #     weights=sample_weights,
-        #     num_samples=len(sample_weights)//100,
-        #     replacement=True  # Allow replacement to ensure balanced sampling
-        # )
-
-        # Create DataLoaders for training and validation
-        # TODO generalize batch size
-        # batch_size = 32
-        # self.train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0, sampler=sampler)
-        # self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-
-
 
         self.base_model_instance = BaseModel(
             device=self.device,
             hazard=self.hazard,
             region=self.region,
             variables=self.variables,
-            neighborhood_size=self.neighborhood_size,
-            train_loader=self.train_loader,
-            val_loader=self.val_loader,
+            patch_size=self.patch_size,
+            batch_size=self.batch_size,
+            sample_size=self.sample_size,
+            model_architecture=self.model_architecture,
+            num_workers=self.num_workers,
             logger=self.logger,
-            seed=self.seed
+            seed=self.seed,
+            use_wandb=self.use_wandb,
+            early_stopping=self.early_stopping,
+            patience=self.patience,
+            min_delta=self.min_delta
             
         )
-        # self.ensemble_model_instance = EnsembleModel(self)
-        # self.meta_model_instance = MetaModel(self)
-
-        # if not (self.hyper and self.partition == 'random'):
-        #     self.preprocess()
-        # self.preprocess()
+    
 
     def set_logger(self, verbose=True):
         """
@@ -776,258 +1438,6 @@ class ModelMgr:
         return logger, ch 
 
 
-
-
-    def load_dataset(self):
-        """
-        
-        Preprocess the data for the model, using the dataset class.
-
-        """
-        # loading partition map 
-        self.logger.info('Loading partition map')
-        partition_map = np.load(f'Input/{self.region}/partition_map/full_balanced_partition_map_sub_countries.npy')
-        partition_shape = partition_map.shape
-
-        dataset = HazardDataset(hazard=self.hazard, variables=self.variables, patch_size=self.neighborhood_size)
-        
-        idx_transform = np.array([[partition_shape[1]],[1]])
-
-        train_indices = (np.argwhere(partition_map == 1) @ idx_transform).flatten()
-        val_indices = (np.argwhere(partition_map == 2) @ idx_transform).flatten()
-        test_indices = (np.argwhere(partition_map == 3) @ idx_transform).flatten()
-
-        train_dataset = Subset(dataset, train_indices)
-        val_dataset = Subset(dataset, val_indices)
-        test_dataset = Subset(dataset, test_indices)
-
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
-
-        self.logger.info(f"Train dataset size: {len(train_dataset)}")
-        self.logger.info(f"Validation dataset size: {len(val_dataset)}")
-        self.logger.info(f"Test dataset size: {len(test_dataset)}")
-
-        # Create DataLoaders for training and validation
-
-        return train_loader, val_loader, test_loader
-
-        
-        
-
-
-
-
-
-    # TODO check if this is needed
-    # def preprocess(self):
-    #     # Load data from .npy files
-    #     # Prepare data for the CNN
-    #     input_data = []
-    #     spatial_split = False
-    #     if self.prep == 'model':
-    #         for var, var_type in zip(self.variables, self.var_types):
-    #             input_data.append(self.load_normalize(var, var_type=var_type))
-    #     elif self.prep == 'stack':
-    #         for i in range(self.ensemble_nr):
-    #             input_data.append(self.load_normalize(f'model_{i}', var_type='label', crop=False)[0])
-    #     elif self.prep == 'multi':
-    #         for var, var_type in zip(self.variables, self.var_types):
-    #             input_data.append(self.load_normalize(var, var_type=var_type))
-    #     elevation = self.load_normalize('elevation', var_type='mask')
-    #     input_data = np.array(input_data)
-
-    #     if self.hazard == 'Landslide':
-    #         labels, output_shape, spatial_split = self.load_normalize('ldm', var_type='label')
-    #     elif self.hazard == 'Flood':
-    #         labels, output_shape, spatial_split = self.load_normalize('flood_surge', var_type='label')
-    #     elif self.hazard == 'Tsunami':
-    #         labels, output_shape, spatial_split = self.load_normalize('tsunami', var_type='label')
-    #     elif self.hazard == 'Multihazard':
-    #         labels, output_shape = self.load_normalize('multi_hazard', var_type='continuous')
-
-    #     # List to store the indices
-    #     self.logger.info('Extracting indices')
-    #     indices_with_values = []
-    #     original_shape = labels.shape
-    #     self.logger.info(f"Input shape: {input_data.shape}")
-    #     self.logger.info(f"Label shape: {labels.shape}")
-    #     if spatial_split is not False:
-    #         self.logger.info(f"Spatial shape: {spatial_split.shape}")
-    #     self.logger.info(f"Elevation shape: {elevation.shape}")
-
-    #     # Iterate over the array   ############## THIS SHOULD BE DONE IN LOAD NORMALIZE
-    #     for idx, data_map in enumerate(elevation):
-    #         if np.any(data_map > -9999): ###### SO WOULD NOT BE BETTER TO CHECK ALL MAPS AND MAKE NODATA=0???? FOR MIN MAX SCALER***
-    #             indices_with_values.append(idx)
-
-    #     # Extract data based on the indices
-    #     input_data = input_data[:, indices_with_values]
-    #     labels = labels[indices_with_values]
-    #     if spatial_split is not False:
-    #         spatial_split = spatial_split[indices_with_values]
-
-    #     self.logger.info(f"Min value INPUT: {np.min(input_data)}")
-    #     self.logger.info(f"Max value INPUT: {np.max(input_data)}")
-    #     self.logger.info(f"Min value LABEL: {np.min(labels)}")
-    #     self.logger.info(f"Max value LABEL: {np.max(labels)}")
-    #     self.logger.info(f"Input shape: {input_data.shape}")
-    #     self.logger.info(f"Label shape: {labels.shape}")
-    #     if spatial_split is not False:
-    #         self.logger.info(f"Spatial shape: {spatial_split.shape}")
-
-    #     # for i in range(len(input_data)):
-    #     #     variables = ['elevation', 'slope', 'landcover', 'aspect', 'NDVI', 'precipitation', 'accuflux', 'HWSD', 'road', 'GEM', 'curvature', 'GLIM']
-    #     #     self.logger.info(f"Variable: {variables[i]}")
-    #     #     self.logger.info(f"Min value INPUT: {np.min(input_data[i])}")
-    #     #     self.logger.info(f"Max value INPUT: {np.max(input_data[i])}")
-    #     # sys.exit(0)
-
-    #     if self.partition == 'random':
-    #         # Generate random indices from the first axis
-    #         if not os.path.exists(f'Output/{self.region}/{self.hazard}/{self.hazard}_Susceptibility_{model_choice}_model_rnd_ind_{self.test}.npy') or self.hyper:
-    #             train_indices = random.sample(range(input_data.shape[1]), int(input_data.shape[1] * self.sample_ratio))
-    #             train_indices = np.save(f'Output/{self.region}/{self.hazard}/{self.hazard}_Susceptibility_{model_choice}_model_rnd_ind_{self.test}.npy', train_indices)
-
-    #         train_indices = np.load(f'Output/{self.region}/{self.hazard}/{self.hazard}_Susceptibility_{model_choice}_model_rnd_ind_{self.test}.npy')
-
-    #         # Create the test set of indices
-    #         all_indices = set(range(input_data.shape[1]))
-    #         complement_indices = list(all_indices - set(train_indices))
-
-    #         test_indices = random.sample(complement_indices, int(input_data.shape[1] * self.test_split))
-    #     elif self.partition == 'spatial':
-    #         if not os.path.exists(f'Output/{self.region}/Susceptibility_spatial_partitioning_train.npy'):
-    #             self.logger.info('INDICES')
-    #             train_indices = np.where(spatial_split == 1)[0]
-    #             self.logger.info(train_indices.shape)
-    #             val_indices = np.where(spatial_split == 2)[0]
-    #             self.logger.info(val_indices.shape)
-    #             test_indices = np.where(spatial_split == 3)[0]
-    #             self.logger.info(test_indices.shape)
-    #             other_indices = np.where(spatial_split == 0)[0]
-    #             self.logger.info(other_indices.shape)
-                
-    #             train_indices = np.save(f'Output/{self.region}/Susceptibility_spatial_partitioning_train.npy', train_indices)
-    #             val_indices = np.save(f'Output/{self.region}/Susceptibility_spatial_partitioning_val.npy', val_indices)
-    #             test_indices = np.save(f'Output/{self.region}/Susceptibility_spatial_partitioning_test.npy', test_indices)
-            
-    #         train_indices = np.load(f'Output/{self.region}/Susceptibility_spatial_partitioning_train.npy')
-    #         val_indices = np.load(f'Output/{self.region}/Susceptibility_spatial_partitioning_val.npy')
-    #         test_indices = np.load(f'Output/{self.region}/Susceptibility_spatial_partitioning_test.npy')
-
-    #     self.input_data = input_data
-    #     self.labels = labels
-
-    #     # Store the selected indices in a new array
-    #     model_inputs = input_data[:, train_indices]
-    #     model_labels = labels[train_indices]
-
-    #     test_data = input_data[:, test_indices]
-    #     test_labels = labels[test_indices]
-
-    #     self.train_indices = train_indices
-    #     self.model_inputs = model_inputs
-    #     self.input_data = input_data
-    #     self.model_labels = model_labels
-    #     self.labels = labels
-    #     self.indices_with_values = indices_with_values
-    #     self.original_shape = original_shape
-    #     self.output_shape = output_shape
-    #     self.test_data = test_data
-    #     self.test_labels = test_labels
-
-    #     if self.partition == 'spatial':
-    #         val_data = input_data[:, val_indices]
-    #         val_labels = labels[val_indices]
-    #         self.val_data = val_data
-    #         self.val_labels = val_labels
-
-    # def load_normalize(self, var, var_type='continuous', crop=True):
-    #     self.logger.info(f'Loading {var}')
-    #     if var == 'landcover' or var == 'NDVI':
-    #         feature_data = np.load(f'Input/Japan/npy_arrays/masked_{var}_japan_flat.npy').astype(np.float32)
-    #     elif var == 'precipitation':
-    #         feature_data = np.load(f'Input/Japan/npy_arrays/masked_{var}_daily_japan.npy').astype(np.float32)
-    #     elif 'base_model' in var:
-    #         feature_data = np.load(f'Output/{self.region}/{var[:-11]}/{self.test}_{var[:-11]}_Susceptibility_base_model.npy').astype(np.float32)
-    #         crop = False
-    #     elif 'model' in var:
-    #         feature_data = np.load(f'Output/{self.region}/{self.hazard}/{self.test}_{self.hazard}_Susceptibility_ensemble_{var}.npy').astype(np.float32)
-    #     else:
-    #         feature_data = np.load(f'Input/Japan/npy_arrays/masked_{var}_japan.npy').astype(np.float32)
-        
-    #     if crop:
-    #         if self.test == 'hokkaido':
-    #             feature_data = feature_data[150:1700,3800:-200]
-    #         elif self.test == 'sado':
-    #             feature_data = feature_data[2755:2955,3525:3675]
-        
-    #     # factor_x, factor_y = int(feature_data.shape[0] / tile), int(feature_data.shape[1] / tile)
-    #     output_shape = feature_data.shape
-        
-    #     # Initialize the scaler, fit and transform the data
-    #     if var_type == 'continuous':
-    #         scaler = MinMaxScaler(feature_range=(0, 1))
-    #         scaled_feature = scaler.fit_transform(feature_data.reshape(-1, 1)).reshape(feature_data.shape)
-    #         scaled_feature = np.nan_to_num(scaled_feature, nan=self.missing_data_value)
-        
-    #     elif var_type == 'categorical':
-    #         feature_data = np.nan_to_num(feature_data, nan=0)
-    #         # Initialize the OneHotEncoder
-    #         encoder = LabelEncoder()
-    #         # Fit and transform the landcover data
-    #         scaled_feature = encoder.fit_transform(feature_data.reshape(-1, 1)).reshape(feature_data.shape)
-
-    #     elif var_type == 'label':
-    #         scaled_feature = np.nan_to_num(feature_data, nan=self.missing_data_value)  # Convert nan to a specific value
-    #         partition_map = np.load('Region/Japan/japan_prefecture_partitions_with_buffer.npy')
-    #         partition_map = partition_map[0:5500,2300:8800]
-    #         self.test_prefectures = [2, 6, 16, 10, 18, 34, 43, 39]
-    #         self.val_prefectures = [7, 17, 23, 26, 32, 37, 44]
-    #         self.train_prefectures = [i for i in range(1, 48) if i not in self.test_prefectures and i not in self.val_prefectures]
-    #         spatial_split = []
-        
-    #     elif var_type == 'mask':
-    #         scaled_feature = feature_data
-
-    #     # Iterate through the array to extract sub-arrays
-    #     scaled_feature_reshape = []
-    #     for i in range(self.neighborhood_size, scaled_feature.shape[0] - self.neighborhood_size):
-    #         for j in range(self.neighborhood_size, scaled_feature.shape[1] - self.neighborhood_size):
-    #             ####### HERE SHOULD BE THE CHECK WITH ELEVATION
-    #             sub_array = scaled_feature[i - self.neighborhood_size: i + self.neighborhood_size + 1, j - self.neighborhood_size: j + self.neighborhood_size + 1]
-    #             if (var_type == 'label' and var != 'road') | (var == 'multi_hazard') | (self.prep == 'multi' and var_type != 'mask'):
-    #                 center_value = sub_array[self.neighborhood_size, self.neighborhood_size]
-    #                 scaled_feature_reshape.append(center_value)
-    #                 if var_type == 'label':
-    #                     if partition_map[i,j] in self.train_prefectures:
-    #                         spatial_split.append(1)
-    #                     elif partition_map[i,j] in self.val_prefectures:
-    #                         spatial_split.append(2)
-    #                     elif partition_map[i,j] in self.test_prefectures:
-    #                         spatial_split.append(3)
-    #                     else:
-    #                         spatial_split.append(0)
-    #                 # if var == 'HWSD':
-    #                 #     print('check')
-    #                 #     sys.exit(0)
-    #             else:
-    #                 scaled_feature_reshape.append(sub_array)
-
-    #     # Convert the list of arrays to a numpy array
-    #     scaled_feature_reshape = np.array(scaled_feature_reshape).astype(np.float32)
-        
-    #     # scaled_feature_reshape = scaled_feature.reshape((factor_x * factor_y, int(scaled_feature.shape[0] / factor_x), int(scaled_feature.shape[1] / factor_y), 1))
-        
-    #     if (var_type == 'label' and var != 'road'):
-    #         return scaled_feature_reshape.reshape(-1, 1, 1), output_shape, np.array(spatial_split)
-    #     elif var == 'multi_hazard':
-    #         return scaled_feature_reshape.reshape(-1, 1, 1), output_shape
-    #     else:
-    #         return np.expand_dims(scaled_feature_reshape, axis=-1)
-
     def train_base_model(self):
         if self.prep != 'stack':
             if self.hyper:
@@ -1035,71 +1445,33 @@ class ModelMgr:
             else:
                 self.logger.info('Training base model')
                 self.base_model_instance.run()
-                self.base_model = self.base_model_instance.base_model
+                self.base_model = self.base_model_instance.model
         else:
             self.logger.info('Only works when prep!=stack')
-    
-    # # TODO - convert to pyTorch
-    # def xload_base_model(self):
-    #     if self.prep != 'stack':
-    #         self.base_model = keras.models.load_model(os.path.join(f'Output/{self.region}', self.hazard, f'base_model_{self.test}.tf'))
-    #     else:
-    #         self.logger.info('Only works when prep!=stack')
-    
-    # def train_ensemble_model(self):
-    #     if self.prep != 'stack':
-    #         if self.hyper:
-    #             self.ensemble_model_instance.HypParOpt()
-    #         else:
-    #             self.ensemble_model_instance.run()
-    #             self.combined_model = self.ensemble_model_instance.combined_model
-    #     else:
-    #         self.logger.info('Only works when prep!=stack')
-
-    # def train_meta_model(self):
-    #     if (self.prep == 'stack') | (self.prep == 'multi'):
-    #         if self.hyper:
-    #             self.meta_model_instance.HypParOpt()
-    #         else:
-    #             self.meta_model_instance.run()
-    #             self.meta_model = self.meta_model_instance.meta_model
-    #     else:
-    #         self.logger.info('Only works when prep=stack | prep=multi')
-
-    # # TODO - convert to pyTorch
-    # def load_meta_model(self):
-    #     if self.prep != 'stack':
-    #         self.meta_model = keras.models.load_model(os.path.join(f'Output/{self.region}', self.hazard, f'meta_model_MLP_{self.test}.tf'))
-    #     else:
-    #         self.logger.info('Only works when prep!=stack')
-
-    # def learning_to_stack(self):
-    #     if self.prep == 'model':
-    #         self.prep = 'stack'
-    #         self.preprocess()
-    #     else:
-    #         self.logger.info('Only works when prep=model')
-
-    # def plot(self, data, name='scaled_feature'):
-    #     fig = plt.figure()
-    #     plt.imshow(data, cmap='viridis')
-    #     plt.title(name)
-    #     plt.colorbar()
-    #     plt.savefig(f'Output/{self.region}/{self.hazard}/{name.replace(" ", "_")}.png', dpi=1000)
-    #     return fig
-
-    # def plot_val_loss(self, history, name='scaled_feature'):
-    #     # Visualize the training and validation loss
-    #     fig = plt.figure()
-    #     plt.plot(history.history['loss'], label='training loss')
-    #     plt.plot(history.history['val_loss'], label='validation loss')
-    #     plt.xlabel('Epochs')
-    #     plt.ylabel('Loss')
-    #     plt.legend()
-    #     plt.savefig(f'Output/{self.region}/{self.hazard}/{name.replace(" ", "_")}.png', dpi=300)
-    #     return fig
-
 
 if __name__ == "__main__":
-    model_manager = ModelMgr(hazard='Wildfire')
-    model_manager.train_base_model()
+    # Example configuration
+    region = 'Europe'
+    hazard = 'Wildfire'
+    batch_size = 1024
+    patch_size = 1
+    base_model = 'MLP'
+    sample_size = 0.01
+    hyper = True
+    use_wandb = True, 
+
+    # Initialize the model manager
+    model_mgr = ModelMgr(
+        region=region,
+        batch_size=batch_size,
+        patch_size=patch_size,
+        base_model=base_model,
+        sample_size=sample_size,
+        hazard=hazard,
+        hyper=hyper,
+        use_wandb=use_wandb, 
+    )
+    # Train the base model
+    model_mgr.train_base_model()
+
+   
