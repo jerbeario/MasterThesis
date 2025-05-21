@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, TensorDataset, Subset, WeightedRandomSa
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.init as init
 
 
 import wandb
@@ -147,7 +148,6 @@ class HazardDataset(Dataset):
         patch = patch.view(self.num_vars, self.patch_size, self.patch_size)
         
         return patch, label
-
 
 # Custom balanced batch sampler
 class BalancedBatchSampler:
@@ -516,10 +516,10 @@ class UNet(nn.Module):
 
 # CNN architecture for hazard susceptibility modeling
 class CNN(nn.Module):
-    def __init__(self, logger, device, num_vars, filters, n_layers, activation, dropout, drop_value, kernel_size, pool_size, patch_size):
+    def __init__(self, logger, num_vars, filters, n_layers, activation, dropout, drop_value, kernel_size, pool_size, patch_size):
         super(CNN, self).__init__()
         self.logger = logger
-        self.device = device
+
         self.num_vars = num_vars
         self.filters = filters
         self.n_layers = n_layers
@@ -587,6 +587,154 @@ class CNN(nn.Module):
         # self.logger.info(f"After sigmoid: {x.shape}")
         return x
     
+# model from Japan paper converted to pytorch
+class SpatialAttentionLayer(nn.Module):
+    def __init__(self, device=None):
+        super(SpatialAttentionLayer, self).__init__()
+        self.device = device
+
+    def build(self, channels):
+        self.conv1x1_theta = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+        self.conv1x1_phi = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+        self.conv1x1_g = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+        
+        # Initialize weights similarly to Keras
+        init.kaiming_normal_(self.conv1x1_theta.weight, mode='fan_in', nonlinearity='relu')
+        init.kaiming_normal_(self.conv1x1_phi.weight, mode='fan_in', nonlinearity='relu')
+        init.xavier_uniform_(self.conv1x1_g.weight)
+        
+        # Move layers to the same device as input
+        if self.device is not None:
+            self.conv1x1_theta = self.conv1x1_theta.to(self.device)
+            self.conv1x1_phi = self.conv1x1_phi.to(self.device)
+            self.conv1x1_g = self.conv1x1_g.to(self.device)
+        
+
+    def forward(self, x):
+        if not hasattr(self, 'conv1x1_theta'):
+            self.build(x.size(1))
+            
+        theta = F.relu(self.conv1x1_theta(x))
+        phi = F.relu(self.conv1x1_phi(x))
+        g = torch.sigmoid(self.conv1x1_g(x))
+
+        theta_phi = theta * phi
+        attention = theta_phi * g
+        attended_x = x + attention
+        
+        return attended_x
+
+class FullCNN(nn.Module):
+    def __init__(self, logger, num_vars, filters=64, kernel_size=3, pool_size=2, 
+                 n_layers=5, device=None, activation=nn.ReLU(), dropout=True, drop_value=0.5, name_model="FullCNN_Model", patch_size=5):
+        super(FullCNN, self).__init__()
+        
+        self.device = device
+        self.logger = logger
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.pool_size = pool_size
+        self.n_layers = n_layers
+        self.activation = activation
+        self.dropout = dropout
+        self.drop_value = drop_value
+        self.name_model = name_model
+        self.patch_size = patch_size
+        self.num_vars = num_vars
+        self.logger.info(f"Initializing {self.name_model} with {num_vars} input variables")
+        
+        # Create modules for each variable input (branches)
+        self._build_conv_branches()
+        
+        # Global average pooling to handle variable spatial dimensions
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+
+        # Calculate the number of output features
+        if self.n_layers == 1:
+            output_filters = self.filters
+        else:
+            output_filters = self.filters * 2
+
+        total_features = output_filters * num_vars
+        
+        self.logger.info(f"Calculated output features: {total_features} (filters={filters}, num_vars={num_vars})")
+        
+        self.dense_layers = nn.Sequential(
+            nn.Linear(total_features, 1024),
+            nn.BatchNorm1d(1024),
+            self.activation,
+            nn.Dropout(self.drop_value) if self.dropout else nn.Identity(),
+            nn.Linear(1024, 1)
+        )
+        
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _build_conv_branches(self):
+        """Build the convolutional branches during initialization"""
+        self.conv_branches = nn.ModuleList()
+        for i in range(self.num_vars):
+            layers = []
+            # First conv layer with spatial attention
+            layers.append(nn.Conv2d(1, self.filters, kernel_size=self.kernel_size, padding='same'))
+            layers.append(self.activation)
+            
+            # Add spatial attention layer
+            spatial_attn = SpatialAttentionLayer(device=self.device)
+            spatial_attn.build(self.filters)
+            layers.append(spatial_attn)
+            
+            # Add pooling layer
+            layers.append(nn.MaxPool2d(kernel_size=self.pool_size, padding=1))
+            
+            # Additional convolutional layers
+            for j in range(self.n_layers - 1):
+                in_filters = self.filters if j == 0 else self.filters * 2
+                layers.append(nn.Conv2d(in_filters, self.filters * 2, kernel_size=self.kernel_size, padding='same'))
+                layers.append(self.activation)
+                
+                if j == 1 or j == 3 or j == self.n_layers - 2:
+                    layers.append(nn.MaxPool2d(kernel_size=self.pool_size, padding=1))
+            
+            self.conv_branches.append(nn.Sequential(*layers))
+            
+    def _initialize_weights(self):
+        """Initialize weights properly"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+        
+        # Xavier/Glorot initialization for the final layer
+        init.xavier_uniform_(self.dense_layers[-1].weight)
+    
+    def forward(self, x):
+        # Process each variable through its branch
+        var_inputs = [x[:, i:i+1, :, :] for i in range(self.num_vars)]
+        
+        features = []
+        for i, branch in enumerate(self.conv_branches):
+            if i < len(var_inputs):
+                feat = branch(var_inputs[i])
+                features.append(feat)
+        
+        # Concatenate features from all branches
+        if len(features) > 1:
+            merged = torch.cat(features, dim=1)
+        else:
+            merged = features[0]
+        
+        # Global average pooling
+        pooled = self.global_avg_pool(merged).view(merged.size(0), -1)
+        
+        # Final dense layers
+        x = self.dense_layers(pooled)
+        
+        # Apply sigmoid for final activation
+        output = torch.sigmoid(x)
+        
+        return output
 
 class BaseModel():
     def __init__(self, device, hazard, region, variables, patch_size, batch_size, model_architecture, 
@@ -605,6 +753,8 @@ class BaseModel():
         self.name_model = hazard + '_' + region + '_base_model'
 
         self.model_architecture = model_architecture
+        self.best_model_state = None
+
 
         # Data
         self.num_workers = num_workers # number of workers for data loading
@@ -613,6 +763,7 @@ class BaseModel():
         
         # Hyperparameters
         self.learning_rate = 0.0001
+        self.weight_decay = 0.0001
         self.filters = 16
         self.n_layers = 3
         self.drop_value = 0.41
@@ -623,10 +774,13 @@ class BaseModel():
         self.n_nodes = 128
 
         # Training
+        self.current_epoch = 0
         self.epochs = 100
         self.early_stopping = early_stopping
         self.patience = patience
         self.min_delta = min_delta
+        self.best_val_loss = float('inf')
+        self.epochs_without_improvement = 0
 
         # WandB 
         if self.use_wandb:
@@ -646,6 +800,9 @@ class BaseModel():
                         "model_type": self.model_architecture 
                     }
                 )
+            self.wandb_run_name = wandb.run.name
+        else:
+            self.wandb_run_name = "no_wandb"
 
         # Build the CNN architecture
         self.model = self.design_basemodel(architecture=self.model_architecture)
@@ -712,6 +869,22 @@ class BaseModel():
                 patch_size=self.patch_size
             )
 
+        elif architecture == 'FullCNN':
+            self.logger.info('Using FullCNN architecture')
+            model = FullCNN(
+                device=self.device,
+                logger=self.logger,
+                num_vars=self.num_vars,
+                filters=self.filters,
+                kernel_size=self.kernel_size,
+                pool_size=self.pool_size,
+                n_layers=self.n_layers,
+                activation=self.activation,
+                dropout=self.dropout,
+                drop_value=self.drop_value,
+                name_model=self.name_model,
+                patch_size=self.patch_size
+            )
         return model
     
     def load_dataset(self):
@@ -749,14 +922,18 @@ class BaseModel():
 
         # Get labels for the subset
         train_labels = dataset.labels.flatten()[train_indices]
+        val_labels = dataset.labels.flatten()[val_indices]
+        test_labels = dataset.labels.flatten()[test_indices]
 
         # Create custom balanced batch sampler
-        batch_sampler = BalancedBatchSampler(train_labels, self.batch_size)
+        train_batch_sampler = BalancedBatchSampler(train_labels, self.batch_size)
+        val_batch_sampler = BalancedBatchSampler(val_labels, self.batch_size)
+        test_batch_sampler = BalancedBatchSampler(test_labels, self.batch_size)
 
         # Create DataLoader with the custom batch sampler
-        train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_sampler=batch_sampler)
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-        test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_sampler=train_batch_sampler)
+        val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_sampler=val_batch_sampler)
+        test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_sampler=test_batch_sampler)
 
         self.logger.info(f"Train dataset size: {len(train_dataset)}")
         self.logger.info(f"Validation dataset size: {len(val_dataset)}")
@@ -775,17 +952,26 @@ class BaseModel():
         if self.use_wandb:
             wandb.watch(self.model, log="all")
 
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay) # added L2 regularization
         # optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate)
-        best_val_loss = float('inf')
-        best_model_state = None
-        epoch_without_improvement = 0
-        
+
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, 
+            step_size=10,           # Reduce LR every 10 epochs
+            gamma=0.5               # Multiply LR by 0.5 (50% reduction)
+        )
+
+
+        self.epochs_without_improvement = 0
+        self.best_val_loss = float('inf')
+
+
         for epoch in range(self.epochs):
+            self.current_epoch = epoch
             self.model.train()
             train_loss = 0.0
             train_accuracy = 0.0
-
+            self.logger.info("epoch : {}".format(epoch))
             for inputs, labels in self.train_loader:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 # Reshape Labels to match output 
@@ -814,27 +1000,31 @@ class BaseModel():
 
             
             # Evaluate on validation data
-            val_loss, val_accuracy = self.evaluate(self.val_loader)
+            val_loss, val_accuracy = self.evaluate()
 
             self.logger.info(f"Epoch {epoch+1}/{self.epochs}")
             self.logger.info(f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
             self.logger.info(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
 
             # Save the best model
-            if val_loss < best_val_loss - self.min_delta:
-                best_val_loss = val_loss
-                torch.save(self.model.state_dict(), f"{self.name_model}_best.pth")
-                best_model_state = self.model.state_dict().copy()
-                epochs_without_improvement = 0
-                self.logger.info(f"  New best model saved (lowest validation loss)")
+            if val_loss < self.best_val_loss - self.min_delta:
+                self.best_val_loss = val_loss
+                self.save_best_model()
+                self.epochs_without_improvement = 0
+                self.logger.info(f"New best model saved (lowest validation loss: {self.best_val_loss:.4f})")
+
             else:
-                epochs_without_improvement += 1
-                self.logger.info(f"  No improvement for {epochs_without_improvement} epochs")
+                self.epochs_without_improvement += 1
+                self.logger.info(f"  No improvement for {self.epochs_without_improvement} epochs")
                 
                 # Early stopping check
-                if self.early_stopping and epochs_without_improvement >= self.patience:
+                if self.early_stopping and self.epochs_without_improvement >= self.patience:
                     self.logger.info(f"Early stopping triggered after {epoch+1} epochs")
                     break
+
+            # Update learning rate
+            scheduler.step()
+            self.learning_rate = scheduler.get_last_lr()[0]
 
 
             # Log metrics to wandb
@@ -847,8 +1037,75 @@ class BaseModel():
                     "val_accuracy": val_accuracy,
                     "learning_rate": self.learning_rate
                 })
+
+    def save_best_model(self):
+        # Create directory if it doesn't exist
+        output_dir = f'Output/{self.region}/{self.hazard}/{self.wandb_run_name}'
+        file_name = f"{self.name_model}_epoch_{self.current_epoch}.pth"
+        os.makedirs(output_dir, exist_ok=True)
         
-    def evaluate(self, data_loader):
+        # Save PyTorch model
+        model_path = os.path.join(output_dir, file_name)
+        torch.save(self.model.state_dict(), model_path)
+        self.best_model_state = self.model.state_dict().copy()
+        
+        # Export to ONNX format
+        self.logger.info('Saving best model in ONNX format')
+        dummy_input = torch.randn(1, self.num_vars, self.patch_size, self.patch_size).to(self.device)
+        onnx_path = f"{output_dir}/{self.name_model}_best.onnx"
+        
+        try:
+            torch.onnx.export(
+                self.model,
+                dummy_input,
+                onnx_path,
+                export_params=True,
+                opset_version=12,
+                do_constant_folding=True,
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes={
+                    'input': {0: 'batch_size'},
+                    'output': {0: 'batch_size'}
+                }
+            )
+            self.logger.info(f"ONNX model saved to {onnx_path}")
+            
+            # Log to wandb if enabled
+            if self.use_wandb:
+                wandb.save(onnx_path)
+        except Exception as e:
+            self.logger.error(f"Failed to export ONNX model: {e}")
+
+    def load_best_model(self):
+        # Add this at the end of the train() method
+        # Load best model and export to ONNX format if not already done
+        if self.best_model_state is not None:
+            self.model.load_state_dict(self.best_model_state)
+            self.logger.info(f"Loaded best model with validation loss: {self.best_val_loss:.4f}")
+            
+            # Check if ONNX file exists
+            onnx_path = f"Output/{self.region}/{self.hazard}/{self.name_model}_best.onnx"
+            if not os.path.exists(onnx_path):
+                self.logger.info('Exporting final best model to ONNX format')
+                dummy_input = torch.randn(1, self.num_vars, self.patch_size, self.patch_size).to(self.device)
+                
+                try:
+                    torch.onnx.export(
+                        self.model, dummy_input, onnx_path,
+                        export_params=True, opset_version=12, do_constant_folding=True,
+                        input_names=['input'], output_names=['output'],
+                        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+                    )
+                    self.logger.info(f"ONNX model saved to {onnx_path}")
+                    
+                    # Log to wandb if enabled
+                    if self.use_wandb:
+                        wandb.save(onnx_path)
+                except Exception as e:
+                    self.logger.error(f"Failed to export ONNX model: {e}")
+        
+    def evaluate(self):
         """
         Evaluate the model on the provided data loader.
         
@@ -861,8 +1118,8 @@ class BaseModel():
 
 
         with torch.no_grad():
-            self.logger.info(f'Evaluating the model with :{len(data_loader)*self.batch_size} samples ')
-            for inputs, labels in data_loader:
+            self.logger.info(f'Evaluating the model with :{len(self.val_loader)*self.batch_size} samples ')
+            for inputs, labels in self.val_loader:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 labels = labels.unsqueeze(1)
 
@@ -882,206 +1139,91 @@ class BaseModel():
 
 
         # Calculate average metrics
-        val_loss /= len(data_loader)
-        val_accuracy /= len(data_loader)
+        val_loss /= len(self.val_loader)
+        val_accuracy /= len(self.val_loader)
         
         return val_loss, val_accuracy
-
-    def predict(self, test_loader):
-        """
-        Make predictions using the trained model.
-        """
-        self.model.eval()
-        predictions = []
-
-        with torch.no_grad():
-            for inputs in test_loader:
-                inputs = inputs.to(self.device)
-                outputs = self.model(inputs)
-                predictions.append(outputs.cpu().numpy())
-
-        return np.concatenate(predictions)
         
     def testing(self):
         """
-        Thoroughly test the model on the test dataset and output comprehensive metrics.
+        Test the model on the test set, log AUROC + other metrics, and export to CSV/W&B/ONNX.
         """
-        self.logger.info('Starting comprehensive model testing')
+    
+        self.logger.info('Testing model...')
         self.model.eval()
-        
-        # Collect all predictions and ground truth
-        y_true = []
-        y_pred = []
-        y_prob = []
-        
+
+        y_true, y_pred, y_prob = [], [], []
+
         with torch.no_grad():
             for inputs, labels in self.test_loader:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
-                outputs = self.model(inputs)
-                
-                # Store predictions and labels
+                outputs = self.model(inputs).squeeze()
                 y_true.extend(labels.cpu().numpy())
                 y_prob.extend(outputs.cpu().numpy())
                 y_pred.extend((outputs > 0.5).cpu().numpy())
-        
-        # Convert to numpy arrays for easier manipulation
-        y_true = np.array(y_true)
-        y_prob = np.array(y_prob)
-        y_pred = np.array(y_pred)
-        
-       
-        
-        # Basic metrics
+
+        y_true, y_pred, y_prob = np.array(y_true), np.array(y_pred), np.array(y_prob)
+
+        # Compute metrics
         accuracy = accuracy_score(y_true, y_pred)
         precision = precision_score(y_true, y_pred, zero_division=0)
         recall = recall_score(y_true, y_pred, zero_division=0)
         f1 = f1_score(y_true, y_pred, zero_division=0)
-        
-        # AUC metrics
-        try:
-            auc_roc = roc_auc_score(y_true, y_prob)
-            avg_precision = average_precision_score(y_true, y_prob)
-        except ValueError:
-            self.logger.warning("Could not calculate AUC metrics - possibly only one class present in test set")
-            auc_roc = np.nan
-            avg_precision = np.nan
-        
-        # Calculate confusion matrix
-        cm = confusion_matrix(y_true, y_pred)
-        
-        # Log metrics
-        self.logger.info(f"Test Results for {self.hazard} {self.model_architecture} model:")
-        self.logger.info(f"  Accuracy: {accuracy:.4f}")
-        self.logger.info(f"  Precision: {precision:.4f}")
-        self.logger.info(f"  Recall: {recall:.4f}")
-        self.logger.info(f"  F1 Score: {f1:.4f}")
-        self.logger.info(f"  AUC-ROC: {auc_roc:.4f}")
-        self.logger.info(f"  Average Precision: {avg_precision:.4f}")
-        self.logger.info(f"  Confusion Matrix: \n{cm}")
-        
-        # Calculate class imbalance
-        class_counts = np.bincount(y_true.astype(int).flatten())
-        class_proportions = class_counts / np.sum(class_counts)
-        self.logger.info(f"  Class distribution: {class_counts}, {class_proportions}")
-        
-        # Generate visualizations
-        # 1. Confusion matrix
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                    xticklabels=['Negative', 'Positive'], 
-                    yticklabels=['Negative', 'Positive'])
-        plt.xlabel('Predicted')
-        plt.ylabel('True')
-        plt.title(f'{self.hazard} {self.model_architecture} Confusion Matrix')
-        plt.tight_layout()
-        plt.savefig(f'{self.name_model}_confusion_matrix.png')
-        
-        # 2. ROC curve
-        if not np.isnan(auc_roc):
-            plt.figure(figsize=(8, 6))
-            fpr, tpr, _ = roc_curve(y_true, y_prob)
-            plt.plot(fpr, tpr, label=f'AUC = {auc_roc:.4f}')
-            plt.plot([0, 1], [0, 1], 'k--')
-            plt.xlabel('False Positive Rate')
-            plt.ylabel('True Positive Rate')
-            plt.title(f'{self.hazard} {self.model_architecture} ROC Curve')
-            plt.legend()
-            plt.savefig(f'{self.name_model}_roc_curve.png')
-        
-        # 3. Precision-Recall curve
-        if not np.isnan(avg_precision):
-            plt.figure(figsize=(8, 6))
-            precision_curve, recall_curve, _ = precision_recall_curve(y_true, y_prob)
-            plt.plot(recall_curve, precision_curve, label=f'AP = {avg_precision:.4f}')
-            # Add baseline based on class imbalance
-            baseline = class_proportions[1] if len(class_proportions) > 1 else 0
-            plt.axhline(y=baseline, color='r', linestyle='--', label=f'Baseline = {baseline:.4f}')
-            plt.xlabel('Recall')
-            plt.ylabel('Precision')
-            plt.title(f'{self.hazard} {self.model_architecture} Precision-Recall Curve')
-            plt.legend()
-            plt.savefig(f'{self.name_model}_pr_curve.png')
-        
-        # Save metrics to CSV
-        metrics_dict = {
-            'Model': [self.model_architecture],
-            'Hazard': [self.hazard],
-            'Accuracy': [accuracy],
-            'Precision': [precision],
-            'Recall': [recall],
-            'F1': [f1],
-            'AUC-ROC': [auc_roc],
-            'Avg_Precision': [avg_precision],
-            'Class_0_Count': [class_counts[0]],
-            'Class_1_Count': [class_counts[1] if len(class_counts) > 1 else 0],
-        }
-        df = pd.DataFrame(metrics_dict)
-        
-        # Create directory if it doesn't exist
+        auc_roc = roc_auc_score(y_true, y_prob)
+
+        # ROC Curve
+        fpr, tpr, _ = roc_curve(y_true, y_prob)
+        plt.figure()
+        plt.plot(fpr, tpr, label=f'AUROC = {auc_roc:.4f}')
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Curve')
+        plt.legend()
+        plt.savefig(f'{self.name_model}_roc_curve.png')
+        plt.close()
+
+        # Save model as ONNX
         os.makedirs(f'Output/{self.region}/{self.hazard}', exist_ok=True)
-        
-        # Save to CSV
-        df.to_csv(f'Output/{self.region}/{self.hazard}/{self.model_architecture}_test_metrics.csv', index=False)
-        
+        dummy_input = torch.randn(1, self.num_vars, self.patch_size, self.patch_size).to(self.device)
+        onnx_path = f'Output/{self.region}/{self.hazard}/{self.name_model}_best.onnx'
+        torch.onnx.export(self.model, dummy_input, onnx_path)
+
+        # Save metrics to CSV
+        results_csv = f'Output/{self.region}/{self.hazard}/all_model_metrics.csv'
+        results = pd.DataFrame([{
+            'Model': self.model_architecture,
+            'Hazard': self.hazard,
+            'Accuracy': accuracy,
+            'Precision': precision,
+            'Recall': recall,
+            'F1': f1,
+            'AUROC': auc_roc,
+            'PatchSize': self.patch_size,
+            'N_Layers': self.n_layers,
+            'N_Filters': self.filters,
+            'LearningRate': self.learning_rate,
+            'Dropout': self.dropout,
+        }])
+        if os.path.exists(results_csv):
+            pd.concat([pd.read_csv(results_csv), results], ignore_index=True).to_csv(results_csv, index=False)
+        else:
+            results.to_csv(results_csv, index=False)
+
         # Log to wandb
         if self.use_wandb:
             wandb.log({
-                "test_accuracy": accuracy,
-                "test_precision": precision,
-                "test_recall": recall,
-                "test_f1": f1,
-                "test_auc_roc": auc_roc,
-                "test_avg_precision": avg_precision,
-                "test_confusion_matrix": wandb.Image(f'{self.name_model}_confusion_matrix.png'),
-                "test_roc_curve": wandb.Image(f'{self.name_model}_roc_curve.png') if not np.isnan(auc_roc) else None,
-                "test_pr_curve": wandb.Image(f'{self.name_model}_pr_curve.png') if not np.isnan(avg_precision) else None,
-                "test_class_balance": wandb.plot.bar(
-                    wandb.Table(data=[[str(i), count] for i, count in enumerate(class_counts)],
-                                columns=["class", "count"]),
-                    "class", "count", title="Test Set Class Distribution"
-                )
+                "Accuracy": accuracy,
+                "Precision": precision,
+                "Recall": recall,
+                "F1": f1,
+                "AUROC": auc_roc,
+                "ROC Curve": wandb.Image(f'{self.name_model}_roc_curve.png'),
             })
-            
-            # Also log feature importance if available
-            if hasattr(self, 'permutation_feature_importance') and len(self.variables) <= 20:
-                self.logger.info("Calculating feature importance...")
-                try:
-                    # Get baseline score
-                    baseline_score = roc_auc_score(y_true, y_prob)
-                    
-                    # Get feature importances using a small subset for efficiency
-                    subset_size = min(5000, len(y_true))
-                    X_subset = torch.stack([batch[0] for batch in list(self.test_loader)[:subset_size//self.batch_size]])
-                    y_subset = y_true[:subset_size]
-                    
-                    feature_importances = self.permutation_feature_importance(
-                        X_subset, y_subset, baseline_score, roc_auc_score)
-                    
-                    # Log feature importances
-                    plt.figure(figsize=(10, 6))
-                    plt.barh(self.variables, feature_importances)
-                    plt.xlabel('Feature Importance')
-                    plt.ylabel('Feature')
-                    plt.title(f'{self.hazard} {self.model_architecture} Feature Importance')
-                    plt.tight_layout()
-                    plt.savefig(f'{self.name_model}_feature_importance.png')
-                    
-                    # Log to wandb
-                    wandb.log({
-                        "feature_importance": wandb.Image(f'{self.name_model}_feature_importance.png')
-                    })
-                except Exception as e:
-                    self.logger.warning(f"Could not calculate feature importance: {e}")
-        
-        self.logger.info("Comprehensive testing completed")    
+            wandb.save(onnx_path)
 
-        # Save the model in the exchangeable ONNX format
-        if self.use_wandb:
-            save_path = f"Output/{self.region}/{self.hazard}/{self.name_model}_best.onnx"
-            self.logger.info('Saving model in ONNX format')
-            inputs = torch.randn(1, self.num_vars, self.patch_size, self.patch_size).to(self.device)
-            torch.onnx.export(self.model, inputs, save_path)
-            wandb.save(save_path)
+        self.logger.info('Testing complete.')
+        return accuracy, precision, recall, f1, auc_roc
 
     def permutation_feature_importance(self, X, y, baseline_score, metric_fn):
         """
@@ -1116,24 +1258,27 @@ class BaseModel():
                     'min': 0.00001,
                     'max': 0.001
                 },
-                # 'filters': {
-                #     'values': [8, 16, 32, 64]
-                # },
-                'n_layers': {
-                    'values': [1, 2, 3, 4,]
+                'weight_decay': {
+                    'distribution': 'log_uniform_values',
+                    'min': 0.00001,
+                    'max': 0.001
                 },
-                'n_nodes': {
-                    'values': [16, 32, 64, 128, 256]
+                'filters': {
+                    'values': [4, 8, 16, 32]
+                },
+                'n_layers': {
+                    'values': [1, 2, 3, 4]
                 },
                 'drop_value': {
                     'distribution': 'uniform',
-                    'min': 0.2,
-                    'max': 0.5
+                    'min': 0.3,
+                    'max': 0.6
                 },
-                'sample_size': {
-                    'values': [0.01, 0.05, 0.1, 0.5, 1]
+                'patch_size': {
+                    'values': [1, 3, 5, 7]
                 },
-            }
+            },
+            'program':'base_model.py'
         }
         
         # Initialize sweep
@@ -1143,10 +1288,9 @@ class BaseModel():
         )
          
         # Start the sweep agent
-        wandb.agent(sweep_id, self.sweep_train, count=10)  # Run 10 trials
+        wandb.agent(sweep_id, self.sweep_train, count=20)  # Run 10 trials
         self.logger.info(f"Hyperparameter sweep completed with ID: {sweep_id}")
  
-
     def sweep_train(self):
         # Initialize new wandb run
         with wandb.init() as run:
@@ -1155,20 +1299,19 @@ class BaseModel():
             
             # Update model hyperparameters
             self.learning_rate = config.learning_rate
-            # self.filters = config.filters
+            self.weight_decay = config.weight_decay
+            self.filters = config.filters
             self.n_layers = config.n_layers 
-            self.n_nodes = config.n_nodes
             self.drop_value = config.drop_value
-            # self.batch_size = config.batch_size
-            self.sample_size = config.sample_size
+            self.patch_size = config.patch_size
             
             # Log configuration for this run
             self.logger.info(f"Sweep run with: lr={self.learning_rate}, "
-                        # f"filters={self.filters}, "
-                        f"n_nodes={self.n_nodes}, "
+                        f"weight_decay={self.weight_decay}, "
+                        f"filters={self.filters}, "
                         f"n_layers={self.n_layers}, "
                         f"dropout={self.drop_value}, "
-                        f"sample_size={self.sample_size}, "
+                        f"patch_size={self.patch_size}, "
             )
             
             # Recreate data loaders with new batch size
@@ -1180,7 +1323,7 @@ class BaseModel():
             
             # Set smaller number of epochs for sweep runs
             original_epochs = self.epochs
-            self.epochs = 20 # Reduced epochs for sweep runs
+            self.epochs = 50 # Reduced epochs for sweep runs
             
             # Use the existing training loop
             self.train()
@@ -1189,12 +1332,16 @@ class BaseModel():
             self.epochs = original_epochs
             
             # Evaluate on test set
-            test_loss, test_accuracy = self.evaluate(self.test_loader)
-            wandb.log({
-                "final_test_loss": test_loss,
-                "final_test_accuracy": test_accuracy
-            })    
 
+            test_accuracy, test_precision, test_recall, test_f1, test_auc_roc  = self.testing()
+            wandb.log({
+                "final_test_accuracy": test_accuracy,
+                "final_test_precision": test_precision,
+                "final_test_recall": test_recall,
+                "final_test_f1": test_f1,
+                "final_test_auc_roc": test_auc_roc,
+            }) 
+          
     @staticmethod
     def safe_binary_crossentropy(y_true, y_pred):
         """
@@ -1309,9 +1456,10 @@ class ModelMgr:
         
         
         self.early_stopping = True
-        self.patience = 5 
+        self.patience = 10
         self.min_delta=0.001
         self.use_wandb = use_wandb
+        print(self.use_wandb)
         self.hazard = hazard
         self.region = region
         self.batch_size = batch_size
@@ -1327,6 +1475,8 @@ class ModelMgr:
         self.model_choice = model_choice
         self.model_architecture = base_model # 'CNN' or 'UNet' or 'SimpleCNN'
         self.partition = partition
+
+
         if self.hazard == 'Landslide':
             self.variables = ['elevation', 'slope', 'landcover', 'aspect', 'NDVI', 'precipitation', 'accuflux', 'HWSD', 'road', 'GEM', 'curvature', 'GLIM']
             self.var_types = ['continuous', 'continuous', 'categorical', 'continuous', 'continuous', 'continuous', 'continuous', 'categorical', 'label', 'continuous', 'continuous', 'categorical']
@@ -1454,11 +1604,11 @@ if __name__ == "__main__":
     region = 'Europe'
     hazard = 'Wildfire'
     batch_size = 1024
-    patch_size = 1
-    base_model = 'MLP'
-    sample_size = 0.01
+    patch_size = 5
+    base_model = 'FullCNN'  # 'FullCNN' or 'UNet' or 'MLP'
+    sample_size = 0.5
     hyper = True
-    use_wandb = True, 
+    use_wandb = True
 
     # Initialize the model manager
     model_mgr = ModelMgr(

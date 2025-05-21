@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -n 1
-#SBATCH -t 00:30:00
+#SBATCH -t 12:00:00
 #SBATCH -p gpu_h100
 #SBATCH --gpus 1
 
