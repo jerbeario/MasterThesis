@@ -178,16 +178,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-Input/Europe/partition_map/countries_rasterized.npy
-.gitignore
 
 Input/Europe/rasters/
-Input/Europe/partition_map/sub_countries_rasterized.npy.DS_Store
-Input/Europe/partition_map/balanced_partition_map_sub_countries.npy
-Input/Europe/partition_map/countries_rasterized.npy
-Input/Europe/partition_map/final_partition_map.npy
-Input/Europe/partition_map/full_balanced_partition_map_sub_countries.npy
-Input/Europe/partition_map/sub_countries_rasterized.npy
-Input/Europe/partition_map/partition_map.npy
-Input/Europe/partition_map/Wildfire_Europe_base_model_best.onnx
+
+Input/Europe/partition_map/
 wandb/
+*.DS_Store
+
