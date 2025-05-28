@@ -185,3 +185,6 @@ Input/Europe/partition_map/
 wandb/
 *.DS_Store
 
+.gitignore
+
+
