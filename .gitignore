@@ -183,8 +183,7 @@ Input/Europe/rasters/
 
 Input/Europe/partition_map/
 wandb/
-*.DS_Store
 
-.gitignore
+.DS_Store
 
 
