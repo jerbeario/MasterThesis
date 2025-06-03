@@ -10,5 +10,5 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate MasterThesis
 
-python base_model.py 
+python HazardMapper/model.py -n baseline -z landslide -s 0.1 -a LR -p 1 -c 1
 wait

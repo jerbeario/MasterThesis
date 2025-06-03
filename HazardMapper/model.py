@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 import pandas as pd
 import os
@@ -28,8 +29,14 @@ from torch.utils.data import DataLoader
 import wandb
 
 from HazardMapper.dataset import HazardDataset, BalancedBatchSampler
-from HazardMapper.model import MLP, CNN, UNet, SimpleCNN, FullCNN
+from HazardMapper.architecture import MLP, CNN, UNet, SimpleCNN, FullCNN, SpatialAttentionCNN
 from HazardMapper.utils import plot_npy_arrays
+
+import numpy as np
+from torch.utils.data import Sampler
+
+plt.style.use('bauhaus_light')
+
 
 class Baseline:
     def __init__(self, hazard, region, sample_size, model_architecture, variables, logger, seed):
@@ -161,6 +168,7 @@ class Baseline:
         feature_list_train_val = []
         feature_list_test = []
 
+        # Load features for each variable
         for variable in self.variables:
             feature = np.load(var_paths[variable]).flatten()
             # convert NaN values to 0
@@ -172,7 +180,13 @@ class Baseline:
 
         X_train_val = np.stack(feature_list_train_val, axis=-1)
         X_test = np.stack(feature_list_test, axis=-1)
-        
+        # sample train_val data to the sample size
+        if self.sample_size < 1.0:
+            n_samples = int(len(X_train_val) * self.sample_size)
+            indices = np.random.choice(len(X_train_val), n_samples, replace=False)
+            X_train_val = X_train_val[indices]
+            y_train_val = y_train_val[indices]
+
 
         # Apply class balancing on train_val data
         X_train_balanced, y_train_balanced = self.balance_classes(X_train_val, y_train_val, ratio=1)
@@ -240,7 +254,7 @@ class Baseline:
    
 class HazardModel():
     def __init__(self, device, hazard, region, variables, patch_size, batch_size, model_architecture, 
-                 logger, seed, use_wandb, sample_size, class_ratio, num_workers, early_stopping, patience, min_delta):
+                 logger, seed, use_wandb, sample_size, class_ratio, sampler, num_workers, early_stopping, patience, min_delta, output_dir):
         super(HazardModel, self).__init__()
 
         # Configs
@@ -265,6 +279,7 @@ class HazardModel():
         self.num_workers = num_workers # number of workers for data loading
         self.sample_size = sample_size # fraction of the dataset to use for training
         self.class_ratio = class_ratio # ratio of positive to negative samples in the dataset
+        self.sampler = sampler
         self.train_loader, self.val_loader, self.test_loader = self.load_dataset()
         
         # Hyperparameters
@@ -281,7 +296,7 @@ class HazardModel():
 
         # Training
         self.current_epoch = 0
-        self.epochs = 100
+        self.epochs = 5
         self.early_stopping = early_stopping
         self.patience = patience
         self.min_delta = min_delta
@@ -305,7 +320,6 @@ class HazardModel():
                         "n_layers": self.n_layers,
                         "dropout": self.dropout,
                         "model_type": self.model_architecture 
-
                     }
                 )
             self.wandb_run_name = wandb.run.name
@@ -313,16 +327,13 @@ class HazardModel():
             self.wandb_run_name = "no_wandb"
 
         # outputs
-        self.output_path = f"Output/{self.region}/{self.hazard}/{self.model_architecture}"
-        if not os.path.exists(self.output_path):
-            os.makedirs(self.output_path, exist_ok=True)
-            self.logger.info(f"Output directory {self.output_path} created.")
+        self.output_dir = output_dir
 
-    def design_basemodel(self, architecture='CNN'):
+    def design_basemodel(self):
         """
         Define the CNN architecture in PyTorch.
         """
-        if architecture == 'MLP':
+        if self.model_architecture == 'MLP':
 
             model = MLP(
                 logger=self.logger,
@@ -335,7 +346,7 @@ class HazardModel():
                 patch_size=self.patch_size
             )
 
-        elif architecture == 'CNN':
+        elif self.model_architecture == 'CNN':
 
             model = CNN(
                 logger=self.logger,
@@ -350,7 +361,7 @@ class HazardModel():
                 pool_size=self.pool_size,
                 patch_size=self.patch_size
             )
-        elif architecture == 'UNet':
+        elif self.model_architecture == 'UNet':
 
             model = UNet(
                 logger=self.logger,
@@ -365,7 +376,7 @@ class HazardModel():
                 pool_size=self.pool_size,
                 patch_size=self.patch_size
             )
-        elif architecture == 'SimpleCNN':
+        elif self.model_architecture == 'SimpleCNN':
 
             model = SimpleCNN(
                 logger=self.logger,
@@ -374,10 +385,11 @@ class HazardModel():
                 filters=self.filters,
                 dropout=self.dropout,
                 drop_value=self.drop_value,
-                patch_size=self.patch_size
+                patch_size=self.patch_size,
+                n_layers=self.n_layers,
             )
 
-        elif architecture == 'FullCNN':
+        elif self.model_architecture == 'FullCNN':
 
             model = FullCNN(
                 device=self.device,
@@ -387,14 +399,29 @@ class HazardModel():
                 kernel_size=self.kernel_size,
                 pool_size=self.pool_size,
                 n_layers=self.n_layers,
-                activation=self.activation,
                 dropout=self.dropout,
                 drop_value=self.drop_value,
                 name_model=self.name_model,
                 patch_size=self.patch_size
             )
 
-        model.to(self.device)
+        elif self.model_architecture == 'SpatialAttentionCNN':
+            model = SpatialAttentionCNN(
+                device=self.device,
+                logger=self.logger,
+                num_vars=self.num_vars,
+                filters=self.filters,
+                # kernel_size=self.kernel_size,
+                # pool_size=self.pool_size,
+                n_layers=self.n_layers,
+                dropout=self.dropout,
+                drop_value=self.drop_value,
+                # name_model=self.name_model,
+                patch_size=self.patch_size
+            )
+
+        self.model = model
+        self.model.to(self.device)
 
         self.logger.info(f'''Model architecture: {self.model_architecture}\n
                             Number of variables: {self.num_vars}\n
@@ -434,30 +461,53 @@ class HazardModel():
 
         np.random.shuffle(train_indices)
         np.random.shuffle(val_indices)
-        np.random.shuffle(test_indices)
+        # np.random.shuffle(test_indices)
 
         train_indices = train_indices[:int(len(train_indices) * self.sample_size)]
         val_indices = val_indices[:int(len(val_indices) * self.sample_size)]
-        test_indices = test_indices[:int(len(test_indices) * self.sample_size)]
+        # test_indices = test_indices[:int(len(test_indices)* self.sample_size)]
 
         train_dataset = Subset(dataset, train_indices)
         val_dataset = Subset(dataset, val_indices)
         test_dataset = Subset(dataset, test_indices)
 
-        # Get labels for the subset
-        train_labels = dataset.labels.flatten()[train_indices]
-        val_labels = dataset.labels.flatten()[val_indices]
+
+        if self.sampler == 'custom':
+            # Get labels for the subset
+            train_labels = dataset.labels.flatten()[train_indices]
+            val_labels = dataset.labels.flatten()[val_indices]
+            
+            # Create custom balanced batch sampler
+            train_batch_sampler = BalancedBatchSampler(train_labels, self.batch_size, neg_ratio=self.class_ratio)
+            val_batch_sampler = BalancedBatchSampler(val_labels, self.batch_size, neg_ratio=self.class_ratio)
+
+            # Create DataLoader with the custom batch sampler
+            train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_sampler=train_batch_sampler)
+            val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_sampler=val_batch_sampler)
+            test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
+            
+
+        elif self.sampler == 'default':
+            # Create DataLoader with the custom batch sampler
+            train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_size= self.batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=True)
+            test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
 
 
-        # Create custom balanced batch sampler
-        train_batch_sampler = BalancedBatchSampler(train_labels, self.batch_size, neg_ratio=self.class_ratio)
-        val_batch_sampler = BalancedBatchSampler(val_labels, self.batch_size, neg_ratio=self.class_ratio)
+        # # Calculate weights for the samples based on class ratio
+        # train_weights = train_labels * self.class_ratio + (1 - train_labels)
+        # val_weights = val_labels * self.class_ratio + (1 - val_labels)
 
 
-        # Create DataLoader with the custom batch sampler
-        train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_sampler=train_batch_sampler)
-        val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_sampler=val_batch_sampler)
-        test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
+        # # Use RandomSampler for training and validation datasets
+        # train_sampler = LargeWeightedRandomSampler(train_weights, num_samples=len(train_labels), replacement=False)
+        # val_sampler = LargeWeightedRandomSampler(val_weights, num_samples=len(val_labels), replacement=False)
+
+
+        # # Create DataLoader with the custom batch sampler
+        # train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_size= self.batch_size, sampler=train_sampler)
+        # val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_size=self.batch_size, sampler=val_sampler)
+        # test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
 
         self.logger.info(f"Train dataset size: {len(train_dataset)}")
         self.logger.info(f"Validation dataset size: {len(val_dataset)}")
@@ -471,17 +521,17 @@ class HazardModel():
         """
         Train the model using the provided data loaders.
         """
-        self.logger.info(f'Training the mode with :{len(self.train_loader)*self.batch_size} samples ')
+        self.logger.info(f'Training the model with :{len(self.train_loader)*self.batch_size} samples ')
         if self.use_wandb:
             wandb.watch(self.model, log="all")
 
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay) # added L2 regularization
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay, ) # added L2 regularization
         # optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate)
 
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, 
             step_size=10,           # Reduce LR every 10 epochs
-            gamma=0.5               # Multiply LR by 0.5 (50% reduction)
+            gamma=0.8               # Multiply LR by 0.5 (50% reduction)
         )
 
 
@@ -494,7 +544,7 @@ class HazardModel():
             self.current_epoch = epoch
             self.model.train()
             train_loss = 0.0
-            train_accuracy = 0.0
+            train_mae = 0.0
 
             for inputs, labels in self.train_loader:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
@@ -503,8 +553,9 @@ class HazardModel():
 
                 # Forward pass
                 outputs = self.model(inputs)
-                loss = F.binary_cross_entropy(outputs, labels)
-                accuracy = self.safe_accuracy(labels, outputs)
+                sample_weigts = labels * self.class_ratio + (1 - labels) 
+                loss = F.binary_cross_entropy(outputs, labels, weight=sample_weigts)
+                mae = self.safe_mae(labels, outputs)
 
                 
                 # Backward pass
@@ -515,20 +566,20 @@ class HazardModel():
                 optimizer.step()
 
                 train_loss += loss.item()
-                train_accuracy += accuracy.item()
+                train_mae += mae.item()
 
             
             # Calculate average metrics
             train_loss /= len(self.train_loader)
-            train_accuracy /= len(self.train_loader)
+            train_mae /= len(self.train_loader)
 
             
             # Evaluate on validation data
-            val_loss, val_accuracy = self.evaluate()
+            val_loss, val_mae = self.evaluate()
 
             self.logger.info(f"Epoch {epoch+1}/{self.epochs}")
-            self.logger.info(f"Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
-            self.logger.info(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
+            self.logger.info(f"Train Loss: {train_loss:.4f}, Train MAE: {train_mae:.4f}")
+            self.logger.info(f"Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}")
 
             # Save the best model
             if val_loss < self.best_val_loss - self.min_delta:
@@ -559,17 +610,26 @@ class HazardModel():
                 wandb.log({
                     "epoch": epoch,
                     "train_loss": train_loss,
-                    "train_accuracy": train_accuracy,
+                    "train_MAE": train_mae,
                     "val_loss": val_loss,
-                    "val_accuracy": val_accuracy,
+                    "val_MAE": val_mae,
                     "learning_rate": self.learning_rate,
                     "epoch_time": self.average_epoch_time,
                 })
 
+    @staticmethod
+    def safe_mae(y_true, y_pred):
+        """
+        Mean absolute error (MAE) loss with NaN handling.
+        """
+        y_pred = torch.nan_to_num(y_pred, nan=0.0)
+        y_true = torch.nan_to_num(y_true, nan=0.0)
+        return torch.mean(torch.abs(y_pred - y_true))
+
     def save_best_model(self):
         # Create directory if it doesn't exist
-        model_path = f"{self.output_path}/models/{self.best_val_loss:4f}_{self.name_model}.pth"
-        onnx_path = f"{self.output_path}/onnx/{self.best_val_loss:4f}_{self.name_model}.onnx"
+        model_path = f"{self.output_dir}/models/{self.best_val_loss:4f}_{self.name_model}.pth"
+        onnx_path = f"{self.output_dir}/models/{self.best_val_loss:4f}_{self.name_model}.onnx"
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
         os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
 
@@ -608,10 +668,23 @@ class HazardModel():
         Load the best model state from the saved file.
         """
         if self.best_model_state is not None:
+            self.design_basemodel()  # Recreate the model architecture
             self.model.load_state_dict(self.best_model_state)
-            self.logger.info("Best model loaded successfully.")
+            self.logger.info("Best model state loaded successfully.")
         else:
-            self.logger.error("No model state available to load. Please train the model first or provide a valid path.")
+            # If no best model state is available, check if a saved model exists
+            model_dir = f"{self.output_dir}/models"
+            model_files = [f for f in os.listdir(model_dir) if f.endswith('.pth')]
+
+            if model_files:
+                # find lowest validation loss model
+                best_model_file = min(model_files, key=lambda f: float(f.split('_')[0]))
+                model_path = f'{model_dir}/{best_model_file}'
+                self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                self.logger.info(f"Best model loaded from {model_path}")
+            else:
+                # If no saved model exists, log an error
+                self.logger.error("No saved model found. Please train the model first or provide a valid path.")
          
     def evaluate(self):
         """
@@ -622,7 +695,7 @@ class HazardModel():
         """
         self.model.eval()
         val_loss = 0.0
-        val_accuracy = 0.0
+        val_mae = 0.0
 
 
         with torch.no_grad():
@@ -637,19 +710,19 @@ class HazardModel():
                 # Calculate metrics
                 # loss = self.safe_binary_crossentropy(labels, outputs)
                 loss = F.binary_cross_entropy(outputs, labels)
-
-                accuracy = self.safe_accuracy(labels, outputs)
+                mae = self.safe_mae(labels, outputs)
 
                 
                 val_loss += loss.item()
-                val_accuracy += accuracy.item()
+                val_mae += mae.item()
 
 
         # Calculate average metrics
         val_loss /= len(self.val_loader)
-        val_accuracy /= len(self.val_loader)
+        val_mae /= len(self.val_loader)
         
-        return val_loss, val_accuracy
+
+        return val_loss, val_mae
         
     def testing(self):
         """
@@ -657,6 +730,8 @@ class HazardModel():
         """
     
         self.logger.info('Testing model...')
+        self.logger.info('Loading best model for testing...')
+        self.load_best_model()
         self.model.eval()
 
         y_true, y_prob = [], []
@@ -691,25 +766,21 @@ class HazardModel():
                 },
                 'weight_decay': {
                     'distribution': 'log_uniform_values',
-                    'min': 0.00001,
-                    'max': 0.001
+                    'min': 0.00005,
+                    'max': 0.005
                 },
                 'filters': {
-                    'values': [4, 8, 16, 32]
+                    'values': [8, 16, 32, 64]
                 },
                 'n_layers': {
-                    'values': [1, 2, 3, 4]
+                    'values': [1, 2, 3]
                 },
                 'drop_value': {
                     'distribution': 'uniform',
-                    'min': 0.3,
-                    'max': 0.6
-                },
-                'patch_size': {
-                    'values': [1, 3, 5, 7]
+                    'min': 0.2,
+                    'max': 0.5
                 },
             },
-            'program':'hazard_model.py'
         }
         
         # Initialize sweep
@@ -719,10 +790,10 @@ class HazardModel():
         )
          
         # Start the sweep agent
-        wandb.agent(sweep_id, self.sweep_train, count=20)  # Run 10 trials
+        wandb.agent(sweep_id, self.sweep, count=100)  # Run 10 trials
         self.logger.info(f"Hyperparameter sweep completed with ID: {sweep_id}")
  
-    def sweep_train(self):
+    def sweep(self):
         # Initialize new wandb run
         with wandb.init() as run:
             # Get hyperparameters from wandb config
@@ -734,7 +805,7 @@ class HazardModel():
             self.filters = config.filters
             self.n_layers = config.n_layers 
             self.drop_value = config.drop_value
-            self.patch_size = config.patch_size
+
             
             # Log configuration for this run
             self.logger.info(f"Sweep run with: lr={self.learning_rate}, "
@@ -742,36 +813,71 @@ class HazardModel():
                         f"filters={self.filters}, "
                         f"n_layers={self.n_layers}, "
                         f"dropout={self.drop_value}, "
-                        f"patch_size={self.patch_size}, "
+
             )
             
             # Recreate data loaders with new batch size
             self.train_loader, self.val_loader, self.test_loader = self.load_dataset()
             
             # Rebuild model with new hyperparameters
-            self.model = self.design_basemodel(architecture=self.model_architecture)
+            self.model = self.design_basemodel()
             self.model.to(self.device)
-            
-            # Set smaller number of epochs for sweep runs
-            original_epochs = self.epochs
-            self.epochs = 50 # Reduced epochs for sweep runs
             
             # Use the existing training loop
             self.train()
             
-            # Restore original epochs
-            self.epochs = original_epochs
-            
             # Evaluate on test set
+            y_true, y_prob  = self.testing()
 
-            test_accuracy, test_precision, test_recall, test_f1, test_auc_roc  = self.testing()
-            wandb.log({
-                "final_test_accuracy": test_accuracy,
-                "final_test_precision": test_precision,
-                "final_test_recall": test_recall,
-                "final_test_f1": test_f1,
-                "final_test_auc_roc": test_auc_roc,
-            }) 
+            # Optimize threshold based on best F1
+            precision_curve, recall_curve, thresholds = precision_recall_curve(y_true, y_prob)
+            f1_scores = 2 * (precision_curve * recall_curve) / (precision_curve + recall_curve + 1e-10)
+            best_idx = np.argmax(f1_scores)
+            best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+
+
+            # Get predictions with best threshold
+            y_pred = (y_prob >= best_threshold).astype(int)
+
+
+            test_accuracy = accuracy_score(y_true, y_pred)
+            test_precision = precision_score(y_true, y_pred, zero_division=0)
+            test_recall = recall_score(y_true, y_pred.astype(int), zero_division=0)
+            test_f1 = f1_score(y_true, y_pred.astype(int), zero_division=0)
+            test_auc_roc = roc_auc_score(y_true, y_prob)
+            test_auprc = average_precision_score(y_true, y_prob)
+            test_mae = self.safe_mae(torch.tensor(y_true, dtype=torch.float32), torch.tensor(y_prob, dtype=torch.float32))
+
+
+            metrics = {
+                "test_mae": test_mae.item(),
+                "test_accuracy": test_accuracy,
+                "test_precision": test_precision,
+                "test_recall": test_recall,
+                "test_f1": test_f1,
+                "test_auc_roc": test_auc_roc,
+                "test_ap": test_auprc,
+                "best_threshold": best_threshold,
+            }
+            wandb.log(metrics)
+
+            hyper_params = {
+                "learning_rate": self.learning_rate,
+                "weight_decay": self.weight_decay,
+                "filters": self.filters,
+                "n_layers": self.n_layers,
+                "drop_value": self.drop_value,
+            }
+
+            # Save results to CSV
+            metrics.update(hyper_params)
+            results_csv = os.path.join(self.output_dir, f'all_model_metrics.csv')
+            results_df = pd.DataFrame([metrics])
+            if os.path.exists(results_csv):
+                pd.concat([pd.read_csv(results_csv), results_df], ignore_index=True).to_csv(results_csv, index=False)
+            else:
+                results_df.to_csv(results_csv, index=False)
+            self.logger.info(f"Metrics saved to {results_csv}")
           
     def predict(self, dataloader):
         """
@@ -789,6 +895,19 @@ class HazardModel():
 
         return np.concatenate(predictions, axis=0)
     
+    def safe_accuracy(self, labels, outputs):
+        """
+        Calculate accuracy while handling potential NaN values in outputs.
+        """
+        # Ensure outputs are between 0 and 1
+        outputs = torch.clamp(outputs, 0, 1)
+        
+        # Convert outputs to binary predictions
+        preds = (outputs > 0.5).float()
+        
+        # Calculate accuracy
+        correct = (preds == labels).float().sum()
+        total = labels.numel()
 # TODO test this function 
     def make_hazard_map(self):
         """
@@ -825,12 +944,18 @@ class HazardModel():
         # Save the hazard map
         output_dir = f'Output/{self.region}/{self.hazard}/hazard_map'
         os.makedirs(output_dir, exist_ok=True)
-        hazard_map_path = os.path.join(output_dir, f"{self.hazard}_hazard_map.npy")
-        np.save(hazard_map_path, hazard_map)
-        self.logger.info(f"Hazard map saved to {hazard_map_path}")
+        hazard_map_npy_path = os.path.join(output_dir, f"{self.hazard}_hazard_map.npy")
+        np.save(hazard_map_npy_path, hazard_map)
+        self.logger.info(f"Hazard map saved to {hazard_map_npy_path}")
 
         # Optionally, visualize the hazard map 
-
+        hazard_map_path = f'{output_dir}/{self.hazard}_hazard_map.png'
+        plot_npy_arrays(
+            hazard_map,
+            title=f"{self.hazard} Hazard Map",
+            name=f'{self.hazard} susceptibility',
+            downsample_factor=10,
+            save_path=hazard_map_path)
         
         # Log to wandb
         if self.use_wandb:
@@ -838,7 +963,7 @@ class HazardModel():
 
 class ModelMgr:
     def __init__(self, region='Europe', batch_size=1024, patch_size=5, architecture='CNN' , sample_size = 1, 
-             class_ratio=0.5, hazard='wildfire', hyper=False, use_wandb=True):
+             class_ratio=0.5, sampler='custom', hazard='wildfire', hyper=False, use_wandb=True, experiement_name='HazardMapper'):
         
         self.early_stopping = True
         self.patience = 10
@@ -849,16 +974,14 @@ class ModelMgr:
         self.batch_size = batch_size
         self.name_model = 'susceptibility'
         self.missing_data_value = 0
-        self.sample_ratio = 0.7
-        self.test_split = 0.15
         self.sample_size = sample_size
         self.class_ratio = class_ratio
         self.num_workers = 8
         self.patch_size = patch_size
         self.hyper = hyper
-        self.model_architecture = architecture # 'CNN' or 'UNet' or 'SimpleCNN'
-
-
+        self.model_architecture = architecture # 'CNN' or 'UNet' or 'SimpleCNN' or 'SpatialAttentionCNN' or 'MLP'
+        self.experiement_name = experiement_name
+        self.sampler = sampler
 
         if self.hazard == 'landslide':
             self.variables = ['elevation', 'slope', 'landcover', 'aspect', 'NDVI', 'precipitation_daily', 'accuflux', 'HWSD', 'GEM', 'curvature', 'GLIM']
@@ -896,16 +1019,19 @@ class ModelMgr:
 
        # PyTorch GPU configuration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-        # self.device = torch.device("cpu")
         self.logger.info(f"Using device: {self.device}")
-        if torch.cuda.is_available():
-            self.logger.info(f"Num GPUs Available: {torch.cuda.device_count()}")
-            self.logger.info(f"GPU Name: {torch.cuda.get_device_name(0)}")
-
         self.logger.info(f"Torch version: {torch.__version__}")
-        
 
-        if self.model_architecture in ["FullCNN", "UNet", "MLP", "CNN", "SimpleCNN"]:
+        # Create output directory if it doesn't exist
+        self.output_dir = f'Output/{self.region}/{self.hazard}/{self.model_architecture}/{self.experiement_name}'
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.logger.info(f"Output directory created at: {self.output_dir}")
+
+        self.hazard_model_instance = None
+        self.baseline_instance = None
+
+        # Initialize model instances based on architecture
+        if self.model_architecture in ["FullCNN", "UNet", "MLP", "CNN", "SimpleCNN", "SpatialAttentionCNN"]:
             self.hazard_model_instance = HazardModel(
                 device=self.device,
                 hazard=self.hazard,
@@ -915,6 +1041,7 @@ class ModelMgr:
                 batch_size=self.batch_size,
                 sample_size=self.sample_size,
                 class_ratio=self.class_ratio,
+                sampler=self.sampler,
                 model_architecture=self.model_architecture,
                 num_workers=self.num_workers,
                 logger=self.logger,
@@ -922,7 +1049,9 @@ class ModelMgr:
                 use_wandb=self.use_wandb,
                 early_stopping=self.early_stopping,
                 patience=self.patience,
-                min_delta=self.min_delta
+                min_delta=self.min_delta,
+                output_dir = self.output_dir
+            
                 
             )
         elif self.model_architecture in ["RF", "LR"]:
@@ -946,7 +1075,7 @@ class ModelMgr:
         # assign logger file name and output directory
         datelog = time.ctime()
         datelog = datelog.replace(':', '_')
-        reference = f'CNN_ls_susc_{self.region}'
+        reference = f'{self.model_architecture}_{self.hazard}_{self.region}'
 
         logfilename = ('logger' + os.sep + reference + '_logfile_' + 
                     str(datelog.replace(' ', '_')) + '.log')
@@ -1033,6 +1162,17 @@ class ModelMgr:
         os.makedirs(output_path, exist_ok=True)
         model_name = f'{self.hazard}_{self.model_architecture}'
 
+        # Save predictions to npy
+        npy_path = os.path.join(output_path, f'{model_name}_predictions.npy')
+        np.save(npy_path, y_prob)
+        self.logger.info(f"Predictions saved to {npy_path}")
+        # Save true labels to npy
+        true_path = os.path.join(output_path, f'true_labels.npy')
+        if not os.path.exists(true_path):
+            np.save(true_path, y_true)
+
+       
+
         # Optimize threshold based on best F1
         precision_curve, recall_curve, thresholds = precision_recall_curve(y_true, y_prob)
         f1_scores = 2 * (precision_curve * recall_curve) / (precision_curve + recall_curve + 1e-10)
@@ -1046,6 +1186,7 @@ class ModelMgr:
         # Compute metrics
         metrics = {
             'Model': model_name,
+            'Experiment': self.experiement_name,
             'Accuracy': accuracy_score(y_true, y_pred),
             'Precision': precision_score(y_true, y_pred, zero_division=0),
             'Recall': recall_score(y_true, y_pred, zero_division=0),
@@ -1080,6 +1221,53 @@ class ModelMgr:
         plt.savefig(pr_path)
         plt.close()
 
+    
+        # Plot output distribution
+        bin_edges = np.arange(0, 1.005, 0.05)
+
+        xy = np.concatenate((y_true.reshape(-1, 1), y_prob.reshape(-1, 1)), axis=1)
+
+        pos = xy[xy[:, 0] == 1]
+        neg = xy[xy[:, 0] == 0]
+
+        pd_path = os.path.join(output_path, f'{model_name}_probability_distribution.png')
+        fig, ax = plt.subplots(1, 2, figsize=(10, 6))
+        bin_edges = np.arange(0, 1.1, 0.1)
+
+        sns.histplot(neg[:, 1], bins=bin_edges, label="Predicted", color="blue", stat="count", element="step", alpha=0.5, ax=ax[0])
+        sns.histplot(neg[:, 0], bins=bin_edges, label="True", color="orange", stat="count", element="step", alpha=0.5, ax=ax[0])
+        sns.histplot(pos[:, 1], bins=bin_edges, label="Predicted", color="blue", stat="count", element="step", alpha=0.5, ax=ax[1])
+        sns.histplot(pos[:, 0], bins=bin_edges, label="True", color="orange", stat="count", element="step", alpha=0.5, ax=ax[1])
+
+        ax[1].set_title("Positive Class")
+        ax[0].set_title("Negative Class")
+
+        ax[0].set_ylabel("Count")
+        ax[1].set_ylabel("")
+
+        ax[1].legend()
+        ax[1].yaxis.tick_right()
+        plt.suptitle(f'Predicted Probability vs True Class Distribution\n{model_name}')
+        plt.tight_layout()
+        plt.savefig(pd_path)
+        plt.close()
+
+
+
+        # Plot predicted probability distribution vs true class distribution
+        plt.figure(figsize=(10, 6))
+        plt.hist(y_prob[y_true == 0], bins=50, alpha=0.5, label='Predicted Probabilities (True Negatives)')
+        plt.hist(y_prob[y_true == 1], bins=50, alpha=0.5, label='Predicted Probabilities (True Positives)')
+        plt.axvline(best_threshold, color='r', linestyle='--', label=f'Best Threshold: {best_threshold:.2f}')
+        plt.xlabel('Predicted Probability')
+        plt.ylabel('Count')
+        plt.title(f'Predicted Probability Distribution vs Actual Class Distribution\n{model_name}')
+        plt.legend()
+        plt.grid(True)
+       
+        
+
+
         # Save results to CSV
         results_csv = os.path.join(output_path, f'all_model_metrics.csv')
         results_df = pd.DataFrame([metrics])
@@ -1088,6 +1276,11 @@ class ModelMgr:
         else:
             results_df.to_csv(results_csv, index=False)
         self.logger.info(f"Metrics saved to {results_csv}")
+
+        # # Save model 
+        # if self.hazard_model_instance is not None:
+        #     self.hazard_model_instance.save_best_model()
+       
 
     def make_hazard_map(self):
         """
@@ -1101,16 +1294,17 @@ if __name__ == "__main__":
 
     # use argparser 
     parser = argparse.ArgumentParser(description='Hazard Mapper Configuration')
-    parser.add_argument('--region', type=str, default='Europe', help='Region for hazard mapping')
-    parser.add_argument('--hazard', type=str, default='landslide', help='Hazard type (wildfire or landslide soon flood)')
-    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for training')
-    parser.add_argument('--patch_size', type=int, default=5, help='Patch size for model input')
-    parser.add_argument('--architecture', type=str, default='FullCNN', help='Model architecture (FullCNN, UNet, MLP, LR, RF)')
-    parser.add_argument('--sample_size', type=float, default=1, help='Sample size for training')
-    parser.add_argument('--class_ratio', type=float, default=9, help='Ratio of negative to positive samples in the batch')
-    parser.add_argument('--hyper', action='store_true', help='Enable hyperparameter optimization')
-    parser.add_argument('--use_wandb', action='store_true', help='Use Weights & Biases for logging')
-
+    parser.add_argument('-n', '--name', type=str, default='HazardMapper', help='Name of the experiment')
+    parser.add_argument('-r', '--region', type=str, default='Europe', help='Region for hazard mapping')
+    parser.add_argument('-z', '--hazard', type=str, default='landslide', help='Hazard type (wildfire or landslide soon flood)')
+    parser.add_argument('-b', '--batch_size', type=int, default=1024, help='Batch size for training')
+    parser.add_argument('-p', '--patch_size', type=int, default=5, help='Patch size for model input')
+    parser.add_argument('-a', '--architecture', type=str, default='SimpleCNN', help='Model architecture (FullCNN, UNet, MLP, LR, RF)')
+    parser.add_argument('-s', '--sample_size', type=float, default=0.5, help='Sample size for training')
+    parser.add_argument('-c', '--class_ratio', type=float, default=9, help='Ratio of negative to positive samples in the batch')
+    parser.add_argument('-y', '--hyper', action='store_true', default=False,  help='Enable hyperparameter optimization')
+    parser.add_argument('-w', '--use_wandb', action='store_true',default=True, help='Use Weights & Biases for logging')
+    parser.add_argument('--sampler', type=str, default='default', help='Sampler type (custom or random)')
     args = parser.parse_args()
 
     region = args.region
@@ -1122,6 +1316,8 @@ if __name__ == "__main__":
     class_ratio = args.class_ratio
     hyper = args.hyper
     use_wandb = args.use_wandb
+    experiement_name = args.name
+    sampler = args.sampler
 
 
     # Initialize the model manager
@@ -1135,8 +1331,15 @@ if __name__ == "__main__":
         hazard=hazard,
         hyper=hyper,
         use_wandb=use_wandb, 
+        experiement_name=experiement_name,
+        sampler=sampler
+
     )
     # Train the base model
-    model_mgr.train_hazard_model()
-    # model_mgr.train_baseline_model()
-    model_mgr.make_hazard_map()
+    # model_mgr.train_hazard_model()
+
+    if architecture in ['RF', 'LR']:
+        model_mgr.train_baseline_model()
+    else:   
+        model_mgr.train_hazard_model()
+    # model_mgr.make_hazard_map()

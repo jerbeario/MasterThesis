@@ -69,37 +69,31 @@ class MLP(nn.Module):
         Forward pass through the MLP.
         
         Args:
-            x: Input tensor of shape [batch_size, num_vars, patch_size, patch_size]
+            x: Input tensor of shape [batch_size, num_vars, 1, 1]
             
         Returns:
             Output tensor of shape [batch_size, 1]
         """
         # Reshape input based on whether it's a single feature vector or patches
         batch_size = x.size(0)
-        
-        if x.size(2) == 1 and x.size(3) == 1:
-            # We have feature vectors [batch_size, num_vars, 1, 1]
-            # Reshape to [batch_size, num_vars]
-            x = x.view(batch_size, self.num_vars)
-        else:
-            # We have patches, so flatten them
-            x = x.view(batch_size, -1)
-        
+        x = x.view(batch_size, self.num_vars)
+    
         # Forward pass through the model
         return self.model(x)
 
 # Simple CNN architecture to test the pipeline
 class SimpleCNN(nn.Module):
-    def __init__(self, logger, device, num_vars, filters=16, dropout=False, 
+    def __init__(self, logger, device, num_vars, filters=16, n_layers=2, dropout=False, 
                  drop_value=0.2, patch_size=5):
         """
-        Simple CNN architecture for hazard susceptibility modeling.
+        Simple CNN with constant filters and variable number of convolutional layers.
         
         Args:
             logger: Logger instance
             device: Torch device
             num_vars: Number of input variables/channels
-            filters: Number of filters in each convolution
+            filters: Number of filters for all convolution layers
+            num_layers: Number of shared convolutional layers after concatenation
             dropout: Whether to use dropout
             drop_value: Dropout probability
             patch_size: Size of the input neighborhood
@@ -109,28 +103,40 @@ class SimpleCNN(nn.Module):
         self.logger = logger
         self.device = device
         self.num_vars = num_vars
+        self.n_layers = n_layers
         
-        # Process each variable with a single conv layer
+        # Per-variable feature extractors
         self.feature_extractors = nn.ModuleList([
-            nn.Conv2d(1, filters, kernel_size=3, padding=1)
+            nn.Sequential(
+                nn.Conv2d(1, filters, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.BatchNorm2d(filters),
+            )
             for _ in range(num_vars)
         ])
         
-        # Shared layers after concatenation
-        self.conv = nn.Conv2d(filters * num_vars, filters * 2, kernel_size=3, padding=1)
+        # Build shared conv block with constant filters
+        shared_convs = []
+        in_channels = filters * num_vars
+        for i in range(n_layers):
+            out_channels = filters  # Constant filters for all layers
+            shared_convs.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            shared_convs.append(nn.ReLU())
+            shared_convs.append(nn.BatchNorm2d(out_channels))
+
+            in_channels = out_channels
+        
+        self.shared_conv = nn.Sequential(*shared_convs)
         self.pool = nn.MaxPool2d(2)
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # Calculate the size after pooling
-        pooled_size = patch_size // 2
         
         # Classification head
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(filters * 2, 64),
+            nn.Linear(filters, 1024),  # Updated to match constant filters
             nn.ReLU(),
             nn.Dropout(drop_value) if dropout else nn.Identity(),
-            nn.Linear(64, 1),
+            nn.Linear(1024, 1),
             nn.Sigmoid()
         )
     
@@ -138,20 +144,13 @@ class SimpleCNN(nn.Module):
         # Split input by variables
         var_inputs = [x[:, i:i+1] for i in range(self.num_vars)]
         
-        # Extract features from each variable
-        features = []
-        for i, (extractor, var_input) in enumerate(zip(self.feature_extractors, var_inputs)):
-            features.append(extractor(var_input))
+        # Extract features
+        features = [extractor(var_input) for extractor, var_input in zip(self.feature_extractors, var_inputs)]
         
-        # Concatenate all features
+        # Concatenate and pass through shared convs
         x = torch.cat(features, dim=1)
-        
-        # Shared processing
-        x = self.conv(x)
-        x = F.relu(x)
+        x = self.shared_conv(x)
         x = self.pool(x)
-        
-        # Global pooling and classification
         x = self.global_pool(x)
         x = self.classifier(x)
         
@@ -412,31 +411,25 @@ class CNN(nn.Module):
     
 # model from Japan paper converted to pytorch
 class SpatialAttentionLayer(nn.Module):
-    def __init__(self, device=None):
+    def __init__(self, channels, device=None):
         super(SpatialAttentionLayer, self).__init__()
         self.device = device
-
-    def build(self, channels):
+        
         self.conv1x1_theta = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
         self.conv1x1_phi = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
         self.conv1x1_g = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
-        
-        # Initialize weights similarly to Keras
+
+        # Initialize weights
         init.kaiming_normal_(self.conv1x1_theta.weight, mode='fan_in', nonlinearity='relu')
         init.kaiming_normal_(self.conv1x1_phi.weight, mode='fan_in', nonlinearity='relu')
         init.xavier_uniform_(self.conv1x1_g.weight)
-        
-        # Move layers to the same device as input
+
         if self.device is not None:
             self.conv1x1_theta = self.conv1x1_theta.to(self.device)
             self.conv1x1_phi = self.conv1x1_phi.to(self.device)
             self.conv1x1_g = self.conv1x1_g.to(self.device)
-        
 
     def forward(self, x):
-        if not hasattr(self, 'conv1x1_theta'):
-            self.build(x.size(1))
-            
         theta = F.relu(self.conv1x1_theta(x))
         phi = F.relu(self.conv1x1_phi(x))
         g = torch.sigmoid(self.conv1x1_g(x))
@@ -446,6 +439,71 @@ class SpatialAttentionLayer(nn.Module):
         attended_x = x + attention
         
         return attended_x
+    
+class SpatialAttentionCNN(nn.Module):
+    def __init__(self, logger, device, num_vars, filters=16, n_layers=2, dropout=False, 
+                 drop_value=0.2, patch_size=5):
+        """
+        Simple CNN with constant filters, variable number of conv layers, and spatial attention.
+        """
+        super(SpatialAttentionCNN, self).__init__()
+        
+        self.logger = logger
+        self.device = device
+        self.num_vars = num_vars
+        self.n_layers = n_layers
+        
+        # Per-variable feature extractors
+        self.feature_extractors = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(1, filters, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.BatchNorm2d(filters),
+
+            )
+            for _ in range(num_vars)
+        ])
+        
+        # Shared conv block with constant filters
+        shared_convs = []
+        in_channels = filters * num_vars
+        for i in range(n_layers):
+            out_channels = filters
+            shared_convs.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            shared_convs.append(nn.ReLU())
+            shared_convs.append(nn.BatchNorm2d(out_channels))
+
+            in_channels = out_channels
+        
+        self.shared_conv = nn.Sequential(*shared_convs)
+        
+        # Add Spatial Attention Layer
+        self.spatial_attention = SpatialAttentionLayer(channels=filters, device=self.device)        
+        self.pool = nn.MaxPool2d(2)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(filters, 1024),
+            nn.ReLU(),
+            nn.Dropout(drop_value) if dropout else nn.Identity(),
+            nn.Linear(1024, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        var_inputs = [x[:, i:i+1] for i in range(self.num_vars)]
+        features = [extractor(var_input) for extractor, var_input in zip(self.feature_extractors, var_inputs)]
+        
+        x = torch.cat(features, dim=1)
+        x = self.shared_conv(x)
+        x = self.spatial_attention(x)  # Apply spatial attention
+        x = self.pool(x)
+        x = self.global_pool(x)
+        x = self.classifier(x)
+        
+        return x
 
 # Full CNN architecture for hazard susceptibility modeling
 class FullCNN(nn.Module):
@@ -532,7 +590,7 @@ class FullCNN(nn.Module):
         
         # Xavier/Glorot initialization for the final layer
         init.xavier_uniform_(self.dense_layers[-1].weight)
-    
+     
     def forward(self, x):
         # Process each variable through its branch
         var_inputs = [x[:, i:i+1, :, :] for i in range(self.num_vars)]
