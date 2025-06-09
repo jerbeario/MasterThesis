@@ -1,0 +1,16 @@
+\begin{table}[h!]
+    \centering
+    \begin{tabularx}{0.8\textwidth}{@{}lXXXXXX@{}}
+    \toprule
+    \textbf{Model} & \textbf{F1} & \textbf{AUROC} & \textbf{AP} & \textbf{MAE} & \textbf{Threshold} \\
+    \midrule
+    SpatialAttentionCNN & 0.717 & 0.989 & 0.722 & 0.019 & 0.184 \\
+    LR & 0.416 & 0.949 & 0.255 & 0.233 & 0.795 \\
+    RF & 0.710 & 0.988 & 0.663 & 0.112 & 0.890 \\
+    SimpleCNN & 0.730 & 0.989 & 0.722 & 0.018 & 0.239 \\
+    MLP & 0.564 & 0.963 & 0.549 & 0.027 & 0.138 \\
+    \bottomrule
+    \end{tabularx}
+    \caption{Evaluation metrics for models on landslide hazard.}
+    \label{tab:evaluation_metrics}
+\end{table}

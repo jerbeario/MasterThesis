@@ -1,3 +1,7 @@
+"""HazardMapper - Architecture Module
+========================
+This module contains various neural network architectures for hazard susceptibility modeling."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,11 +34,6 @@ class MLP(nn.Module):
         # For feature vector input, input size is just num_vars
         # (when patch_size=1, we get features only with no spatial context)
         input_size = num_vars
-        if patch_size > 1:
-            # If using patches, flatten them
-            input_size = num_vars * patch_size * patch_size
-            self.logger.warning(f"Using MLP with patch_size={patch_size}. "
-                               f"Consider using patch_size=1 for feature vectors.")
         
         # Build the MLP layers
         layers = []
@@ -80,6 +79,37 @@ class MLP(nn.Module):
     
         # Forward pass through the model
         return self.model(x)
+
+import torch.nn as nn
+
+class CNN(nn.Module):
+    def __init__(self, in_channels: int, n_layers: int = 2, n_filters: int = 32, drop_value: float = 0.3, patch_size: int = 5):
+        super(CNN, self).__init__()
+        
+        conv_layers = []
+        current_channels = in_channels
+
+        for i in range(n_layers):
+            out_channels = n_filters * (2 ** i)
+            conv_layers.append(nn.Conv2d(current_channels, out_channels, kernel_size=3, padding=1))
+            conv_layers.append(nn.BatchNorm2d(out_channels))
+            conv_layers.append(nn.ReLU())
+            current_channels = out_channels
+
+        self.conv_block = nn.Sequential(*conv_layers)
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),  # Output size: current_channels * 5 * 5
+            nn.Linear(current_channels * patch_size * patch_size, 256),
+            nn.ReLU(),
+            nn.Dropout(drop_value),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.conv_block(x)
+        return self.classifier(x)
 
 # Simple CNN architecture to test the pipeline
 class SimpleCNN(nn.Module):
@@ -335,79 +365,6 @@ class UNet(nn.Module):
         # Final classification
         outputs = self.classification_head(x)
         return torch.sigmoid(outputs)
-
-# CNN architecture for hazard susceptibility modeling
-class CNN(nn.Module):
-    def __init__(self, logger, num_vars, filters, n_layers, activation, dropout, drop_value, kernel_size, pool_size, patch_size):
-        super(CNN, self).__init__()
-        self.logger = logger
-
-        self.num_vars = num_vars
-        self.filters = filters
-        self.n_layers = n_layers
-        self.activation = activation
-        self.dropout = dropout
-        self.drop_value = drop_value
-        self.kernel_size = kernel_size
-        self.pool_size = pool_size
-        self.patch_size = patch_size
-
-        # Define variable-specific blocks
-        self.var_blocks = nn.ModuleList()
-        for _ in range(self.num_vars):
-            layers = [
-                nn.Conv2d(1, self.filters, kernel_size=self.kernel_size, padding='same'),
-                nn.ReLU(),
-                nn.MaxPool2d(self.pool_size)
-            ]
-            self.var_blocks.append(nn.Sequential(*layers))
-
-        # Global average pooling
-        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        # Fully connected layers
-        fc_input_size = self.filters * self.num_vars  # Adjust based on architecture
-        self.fc1 = nn.Linear(fc_input_size, 1024)
-        self.bn1 = nn.BatchNorm1d(1024)
-        self.drop_layer = nn.Dropout(self.drop_value) if self.dropout else nn.Identity()
-        self.output_layer = nn.Linear(1024, 1)
-
-    def forward(self, inputs):
-        # Split inputs into a list of tensors, one for each variable
-        inputs = [inputs[:, i, :, :].unsqueeze(1) for i in range(self.num_vars)]
-        # self.logger.info(f"Split input shapes: {[inp.shape for inp in inputs]}")
-
-        # Process each variable through its block
-        features = []
-        for i, (block, inp) in enumerate(zip(self.var_blocks, inputs)):
-            x = block(inp)
-            # self.logger.info(f"After var_blocks[{i}]: {x.shape}")
-            features.append(x)
-
-        # Concatenate features along the channel dimension
-        x = torch.cat(features, dim=1)
-        # self.logger.info(f"After concatenation: {x.shape}")
-
-        # Global average pooling
-        x = self.global_avg_pool(x)
-        # self.logger.info(f"After global_avg_pool: {x.shape}")
-
-        # Flatten the tensor
-        x = x.view(x.size(0), -1)
-        # self.logger.info(f"After flattening: {x.shape}")
-
-        # Pass through fully connected layers
-        x = self.fc1(x)
-        # self.logger.info(f"After fc1: {x.shape}")
-        x = self.bn1(x)
-        # self.logger.info(f"After bn1: {x.shape}")
-        x = self.activation(x)
-        x = self.drop_layer(x)
-        x = self.output_layer(x)
-        # self.logger.info(f"After output_layer: {x.shape}")
-        x = torch.sigmoid(x)
-        # self.logger.info(f"After sigmoid: {x.shape}")
-        return x
     
 # model from Japan paper converted to pytorch
 class SpatialAttentionLayer(nn.Module):
@@ -562,8 +519,7 @@ class FullCNN(nn.Module):
             layers.append(self.activation)
             
             # Add spatial attention layer
-            spatial_attn = SpatialAttentionLayer(device=self.device)
-            spatial_attn.build(self.filters)
+            spatial_attn = SpatialAttentionLayer(device=self.device, channels=self.num_vars)
             layers.append(spatial_attn)
             
             # Add pooling layer

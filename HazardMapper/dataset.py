@@ -1,7 +1,58 @@
+""" HazardMapper - Dataset Module 
+========================
+This module defines a custom dataset for loading hazard-specific features and labels as patches.
+The paths to the variables and labels are defined in dictionaries, and the dataset can be used with PyTorch's DataLoader for training models.
+
+"""
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader, Sampler 
 
+var_paths = {
+    # Conditioning Factors
+    "soil_moisture_root" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_soil_moisture_root_Europe.npy",
+    "soil_moisture_surface" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_soil_moisture_surface_Europe.npy",
+    "NDVI" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_NDVI_Europe_flat.npy",
+    "landcover" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_landcover_Europe_flat.npy",
+    "wind_direction_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_wind_direction_daily_Europe.npy",
+    "wind_speed_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_wind_speed_daily_Europe.npy",
+    "temperature_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_temperature_daily_Europe.npy",
+    "precipitation_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_precipitation_daily_Europe.npy",
+    "fire_weather" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_fire_weather_Europe.npy",
+    "HWSD" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_HWSD_Europe.npy",
+    "pga" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_pga_Europe.npy",
+    "accuflux" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_accuflux_Europe.npy",
+    "coastlines" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_coastlines_Europe.npy",
+    "rivers" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_rivers_Europe.npy",
+    "slope" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_slope_Europe.npy",
+    "strahler" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_strahler_Europe.npy",
+    "GLIM" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_GLIM_Europe.npy",
+    "GEM" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_GEM_Europe.npy",
+    "aspect" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_aspect_Europe.npy",
+    "elevation" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_elevation_Europe.npy",
+    "curvature" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_curvature_Europe.npy",
+    "test": "/Users/jeremypalmerio/Repos/MasterThesis/Input/Europe/npy_arrays/masked_fire_weather_Europe.npy",
+
+    # Hazard Maps
+    "drought" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_drought_Europe.npy",
+    "heatwave" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_heatwave_Europe.npy",
+    "extreme_wind" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_extreme_wind_Europe.npy",
+    "volcano" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_volcano_Europe.npy",
+    "wildfire" : "/projects/FWC2/MYRIAD/Susceptibility/Output/Europe/wildfire/hazard_map/wildfire_hazard_map.npy",
+    "flood" : "/projects/FWC2/MYRIAD/Susceptibility/Output/Europe/flood/hazard_map/flood_hazard_map.npy",
+    "landslide" : "/projects/FWC2/MYRIAD/Susceptibility/Output/Europe/landslide/hazard_map/landslide_hazard_map.npy",
+   \
+}
+
+label_paths = {
+    # Hazard Inventories
+    "test": "/Users/jeremypalmerio/Repos/MasterThesis/Input/Europe/npy_arrays/masked_landslide_Europe.npy",
+    "wildfire" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/masked_wildfire_Europe.npy",
+    "flood" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/masked_flood_Europe.npy",
+    "landslide" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/masked_landslide_Europe.npy",
+    "multi_hazard" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/masked_multi_hazard_Europe.npy",
+}
 
 # This class is finished and ready to be used
 class HazardDataset(Dataset):
@@ -17,52 +68,18 @@ class HazardDataset(Dataset):
         self.patch_size = patch_size
         self.variables = variables
         self.num_vars = len(variables)
-
-        # Define the feature file paths for each hazard
-
-        self.var_paths = {
-            "soil_moisture_root" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_soil_moisture_root_Europe.npy",
-            "soil_moisture_surface" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_soil_moisture_surface_Europe.npy",
-            "NDVI" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_NDVI_Europe_flat.npy",
-            "landcover" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_landcover_Europe_flat.npy",
-            "wind_direction_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_wind_direction_daily_Europe.npy",
-            "wind_speed_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_wind_speed_daily_Europe.npy",
-            "temperature_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_temperature_daily_Europe.npy",
-            "precipitation_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_precipitation_daily_Europe.npy",
-            "fire_weather" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_fire_weather_Europe.npy",
-            "HWSD" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_HWSD_Europe.npy",
-            "pga" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_pga_Europe.npy",
-            "accuflux" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_accuflux_Europe.npy",
-            "coastlines" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_coastlines_Europe.npy",
-            "rivers" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_rivers_Europe.npy",
-            "slope" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_slope_Europe.npy",
-            "strahler" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_strahler_Europe.npy",
-            "GLIM" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_GLIM_Europe.npy",
-            "GEM" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_GEM_Europe.npy",
-            "aspect" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_aspect_Europe.npy",
-            "elevation" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_elevation_Europe.npy",
-            "curvature" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_curvature_Europe.npy",
-            "test": "/Users/jeremypalmerio/Repos/MasterThesis/Input/Europe/npy_arrays/masked_fire_weather_Europe.npy"
-        }
-
-        self.label_paths = {
-            "wildfire" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/masked_wildfire_Europe.npy",
-            "test" : "/Users/jeremypalmerio/Repos/MasterThesis/Input/Europe/npy_arrays/masked_wildfire_Europe.npy",
-            "landslide" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/masked_landslide_Europe.npy",
-
-        }
      
         # Check if the hazard is valid
-        if self.hazard not in self.label_paths.keys():
+        if self.hazard not in label_paths.keys():
             raise ValueError(f"Hazard '{self.hazard}' is not defined in the dataset.")
         # Check if the variables are valid
         for variable in variables:
-            if variable not in self.var_paths.keys():
+            if variable not in var_paths.keys():
                 raise ValueError(f"Variable '{variable}' is not defined in the dataset.")
     
         # get features and labels for the hazard
-        self.feature_paths = [self.var_paths[variable] for variable in self.variables]
-        self.label_path = self.label_paths[self.hazard]
+        self.feature_paths = [var_paths[variable] for variable in self.variables]
+        self.label_path = label_paths[self.hazard]
 
         # Load features (stacked along the first axis for channels)
         self.features = np.stack([np.load(path) for path in self.feature_paths], axis=0)
@@ -206,7 +223,7 @@ def index1d_to_2d(idx):
     
     Parameters:
         idx: An integer or an array-like of integers representing indices in the flattened array.
-        shape: Tuple of (n_rows, n_cols) for the original 2D array.
+
     
     Returns:
         A tuple (row, col) if a single index is provided, or

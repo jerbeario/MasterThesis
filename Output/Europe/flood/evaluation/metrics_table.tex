@@ -1,0 +1,16 @@
+\begin{table}[h!]
+    \centering
+    \begin{tabularx}{0.8\textwidth}{@{}lXXXXXX@{}}
+    \toprule
+    \textbf{Model} & \textbf{F1} & \textbf{AUROC} & \textbf{AP} & \textbf{MAE} & \textbf{Threshold} \\
+    \midrule
+    SpatialAttentionCNN & 0.444 & 0.857 & 0.433 & 0.095 & 0.326 \\
+    SimpleCNN & 0.443 & 0.857 & 0.446 & 0.080 & 0.289 \\
+    MLP & 0.356 & 0.780 & 0.331 & 0.104 & 0.208 \\
+    LR & 0.285 & 0.742 & 0.223 & 0.450 & 0.783 \\
+    RF & 0.371 & 0.816 & 0.342 & 0.351 & 0.810 \\
+    \bottomrule
+    \end{tabularx}
+    \caption{Evaluation metrics for models on flood hazard.}
+    \label{tab:evaluation_metrics}
+\end{table}

@@ -1,3 +1,9 @@
+""" HazardMapper - Model module.
+==========================
+This module contains the Baseline and HazardModel classes for training and evaluating hazard susceptibility models.
+A ModelMgr class is also included to handle the training and evaluation of different model architectures.
+"""
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
@@ -12,7 +18,7 @@ import sys
 import time
 import argparse
 
-
+from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -24,11 +30,12 @@ from sklearn.metrics import (
 import torch
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 import torch.nn.functional as F
+from torch.nn import BCELoss, CrossEntropyLoss
 from torch.utils.data import DataLoader
 
 import wandb
 
-from HazardMapper.dataset import HazardDataset, BalancedBatchSampler
+from HazardMapper.dataset import HazardDataset, BalancedBatchSampler, var_paths, label_paths
 from HazardMapper.architecture import MLP, CNN, UNet, SimpleCNN, FullCNN, SpatialAttentionCNN
 from HazardMapper.utils import plot_npy_arrays
 
@@ -36,6 +43,9 @@ import numpy as np
 from torch.utils.data import Sampler
 
 plt.style.use('bauhaus_light')
+
+
+
 
 
 class Baseline:
@@ -51,7 +61,7 @@ class Baseline:
         self.num_vars = len(variables)
 
         # Check if the model architecture is valid
-        if self.model_architecture not in ["RF", "LR"]:
+        if self.model_architecture not in ["RF", "LR", "MLPC"]:
             raise ValueError(f"Baseline architecture '{self.model_architecture}' is not defined.")
 
         self.logger.info(f'Loading data...')
@@ -107,41 +117,6 @@ class Baseline:
 
     def load_data(self):
 
-        # Define the feature file paths for each hazard
-
-        var_paths = {
-            "soil_moisture_root" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_soil_moisture_root_Europe.npy",
-            "soil_moisture_surface" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_soil_moisture_surface_Europe.npy",
-            "NDVI" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_NDVI_Europe_flat.npy",
-            "landcover" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_landcover_Europe_flat.npy",
-            "wind_direction_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_wind_direction_daily_Europe.npy",
-            "wind_speed_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_wind_speed_daily_Europe.npy",
-            "temperature_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_temperature_daily_Europe.npy",
-            "precipitation_daily" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_precipitation_daily_Europe.npy",
-            "fire_weather" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_fire_weather_Europe.npy",
-            "HWSD" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_HWSD_Europe.npy",
-            "pga" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_pga_Europe.npy",
-            "accuflux" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_accuflux_Europe.npy",
-            "coastlines" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_coastlines_Europe.npy",
-            "rivers" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_rivers_Europe.npy",
-            "slope" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_slope_Europe.npy",
-            "strahler" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_strahler_Europe.npy",
-            "GLIM" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_GLIM_Europe.npy",
-            "GEM" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_GEM_Europe.npy",
-            "aspect" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_aspect_Europe.npy",
-            "elevation" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_elevation_Europe.npy",
-            "curvature" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/normalized_masked_curvature_Europe.npy",
-            "test": "/Users/jeremypalmerio/Repos/MasterThesis/Input/Europe/npy_arrays/masked_fire_weather_Europe.npy",
-            "elevation2" : "Input/Europe/npy_arrays/masked_elevation_Europe.npy",
-        }
-
-        label_paths = {
-            "wildfire" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/masked_wildfire_Europe.npy",
-            "test" : "/Users/jeremypalmerio/Repos/MasterThesis/Input/Europe/npy_arrays/masked_wildfire_Europe.npy",
-            "landslide" : "/projects/FWC2/MYRIAD/Susceptibility/Input/Europe/npy_arrays/masked_landslide_Europe.npy",
-
-        }
-     
         # Check if the hazard is valid
         if self.hazard not in label_paths.keys():
             raise ValueError(f"Hazard '{self.hazard}' is not defined in the dataset.")
@@ -149,7 +124,7 @@ class Baseline:
         for variable in self.variables:
             if variable not in var_paths.keys():
                 raise ValueError(f"Variable '{variable}' is not defined in the dataset.")
-        partition_map = np.load(f'Input/{self.region}/partition_map/{self.hazard}_partition_map.npy')
+        partition_map = np.load(f'Input/{self.region}/partition_map/balanced_{self.hazard}_partition_map.npy')
         elevation_map = np.load(var_paths["elevation"])
         valid_mask = ~np.isnan(elevation_map)
 
@@ -189,7 +164,15 @@ class Baseline:
 
 
         # Apply class balancing on train_val data
-        X_train_balanced, y_train_balanced = self.balance_classes(X_train_val, y_train_val, ratio=1)
+        # X_train_balanced, y_train_balanced = self.balance_classes(X_train_val, y_train_val, ratio=1)
+        X_train_balanced = X_train_val
+        y_train_balanced = y_train_val
+
+        self.logger.info(f"Train/Val data shape: {X_train_balanced.shape}, Labels shape: {y_train_balanced.shape}")
+        self.logger.info(f"Class balance in train/val set: {np.bincount(y_train_balanced)}")
+        self.logger.info(f"Test data shape: {X_test.shape}, Labels shape: {y_test.shape}")
+        self.logger.info(f"Class balance in test set: {np.bincount(y_test)}")
+
 
         return X_train_balanced, y_train_balanced, X_test, y_test
     
@@ -198,22 +181,37 @@ class Baseline:
         if self.model_architecture == "RF":
             model = RandomForestClassifier(
                 n_estimators=100,
-                max_depth=None,
+                max_depth=10,
                 min_samples_split=2,
                 min_samples_leaf=1,
                 max_features="sqrt",
                 random_state=self.seed,
+                n_jobs=-1,  # Use all available cores
             )
         elif self.model_architecture == "LR":
             model = LogisticRegression(
                 penalty="l2",
                 C=1.0,
-                solver="lbfgs",
+                solver="sag",
                 max_iter=100,
                 random_state=self.seed,
             )
+        elif self.model_architecture == "MLPC":
+            model = MLPClassifier(
+                hidden_layer_sizes=(128, 128),  # Example architecture
+                activation='relu',
+                solver='adam',
+                alpha=0.0001,
+                batch_size=1024,
+                learning_rate='constant',
+                learning_rate_init=0.001,
+                max_iter= 100,
+                random_state=self.seed,
+                verbose=True,
+
+            )
         else:
-            raise ValueError(f"Model '{self.model}' is not defined. Choose 'RF' or 'LR'.")
+            raise ValueError(f"Model '{self.model}' is not defined. Choose 'RF' or 'LR' or 'MLPC.")
         
         return model
 
@@ -254,7 +252,7 @@ class Baseline:
    
 class HazardModel():
     def __init__(self, device, hazard, region, variables, patch_size, batch_size, model_architecture, 
-                 logger, seed, use_wandb, sample_size, class_ratio, sampler, num_workers, early_stopping, patience, min_delta, output_dir):
+                 logger, seed, use_wandb, sample_size, class_ratio, sampler, num_workers, epoch, early_stopping, patience, min_delta, output_dir):
         super(HazardModel, self).__init__()
 
         # Configs
@@ -283,11 +281,11 @@ class HazardModel():
         self.train_loader, self.val_loader, self.test_loader = self.load_dataset()
         
         # Hyperparameters
-        self.learning_rate = 0.0001
+        self.learning_rate = 0.001
         self.weight_decay = 0.0001
-        self.filters = 64
-        self.n_layers = 1
-        self.drop_value = 0.4
+        self.filters = 64 #64
+        self.n_layers = 3 #1
+        self.drop_value =  0.3 #0.4
         self.kernel_size = 3
         self.pool_size = 2  
         self.activation = torch.nn.ReLU()
@@ -296,7 +294,7 @@ class HazardModel():
 
         # Training
         self.current_epoch = 0
-        self.epochs = 5
+        self.epochs = epoch
         self.early_stopping = early_stopping
         self.patience = patience
         self.min_delta = min_delta
@@ -349,16 +347,12 @@ class HazardModel():
         elif self.model_architecture == 'CNN':
 
             model = CNN(
-                logger=self.logger,
-                device=self.device,
-                num_vars=self.num_vars,
-                filters=self.filters,
+
+
+                in_channels=self.num_vars,
+                n_filters=self.filters,
                 n_layers=self.n_layers,
-                activation=self.activation,
-                dropout=self.dropout,
                 drop_value=self.drop_value,
-                kernel_size=self.kernel_size,
-                pool_size=self.pool_size,
                 patch_size=self.patch_size
             )
         elif self.model_architecture == 'UNet':
@@ -447,7 +441,7 @@ class HazardModel():
         # loading partition map 
         # TODO generalize for other hazard partition maps
         self.logger.info('Loading partition map')
-        partition_map = np.load(f'Input/{self.region}/partition_map/{self.hazard}_partition_map.npy')
+        partition_map = np.load(f'Input/{self.region}/partition_map/balanced_{self.hazard}_partition_map.npy')
         partition_shape = partition_map.shape
         self.logger.info(f'Splitting dataset into train, validation and test sets')
 
@@ -459,39 +453,45 @@ class HazardModel():
         val_indices = (np.argwhere(partition_map == 2) @ idx_transform).flatten()
         test_indices = (np.argwhere(partition_map == 3) @ idx_transform).flatten()
 
-        np.random.shuffle(train_indices)
-        np.random.shuffle(val_indices)
-        # np.random.shuffle(test_indices)
+        # np.random.shuffle(train_indices)
+        # np.random.shuffle(val_indices)
+        # # np.random.shuffle(test_indices)
 
-        train_indices = train_indices[:int(len(train_indices) * self.sample_size)]
-        val_indices = val_indices[:int(len(val_indices) * self.sample_size)]
-        # test_indices = test_indices[:int(len(test_indices)* self.sample_size)]
+        # train_sample_size = min(1_000_000, len(train_indices))
+        # test_sanple_size = min(200_000, len(test_indices))
+        # val_sample_size = min(200_000, len(val_indices))
+
+
+        # train_indices = train_indices[:train_sample_size]
+        # val_indices = val_indices[:val_sample_size]
+        # test_indices = test_indices[:test_sanple_size]
 
         train_dataset = Subset(dataset, train_indices)
         val_dataset = Subset(dataset, val_indices)
         test_dataset = Subset(dataset, test_indices)
 
 
-        if self.sampler == 'custom':
-            # Get labels for the subset
-            train_labels = dataset.labels.flatten()[train_indices]
-            val_labels = dataset.labels.flatten()[val_indices]
+        # if self.sampler == 'custom':
+        #     # Get labels for the subset
+        #     train_labels = dataset.labels.flatten()[train_indices]
+        #     val_labels = dataset.labels.flatten()[val_indices]
             
-            # Create custom balanced batch sampler
-            train_batch_sampler = BalancedBatchSampler(train_labels, self.batch_size, neg_ratio=self.class_ratio)
-            val_batch_sampler = BalancedBatchSampler(val_labels, self.batch_size, neg_ratio=self.class_ratio)
+        #     # Create custom balanced batch sampler
+        #     train_batch_sampler = BalancedBatchSampler(train_labels, self.batch_size, neg_ratio=self.class_ratio)
+        #     val_batch_sampler = BalancedBatchSampler(val_labels, self.batch_size, neg_ratio=self.class_ratio)
 
-            # Create DataLoader with the custom batch sampler
-            train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_sampler=train_batch_sampler)
-            val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_sampler=val_batch_sampler)
-            test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
+        #     # Create DataLoader with the custom batch sampler
+        #     train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_sampler=train_batch_sampler)
+        #     val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_sampler=val_batch_sampler)
+        #     test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
             
 
-        elif self.sampler == 'default':
-            # Create DataLoader with the custom batch sampler
-            train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_size= self.batch_size, shuffle=True)
-            val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=True)
-            test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
+        # elif self.sampler == 'default':
+        #     # Create DataLoader with the custom batch sampler
+
+        train_loader = DataLoader(train_dataset, num_workers=self.num_workers, batch_size= self.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=True)
+        test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
 
 
         # # Calculate weights for the samples based on class ratio
@@ -509,9 +509,9 @@ class HazardModel():
         # val_loader = DataLoader(val_dataset, num_workers=self.num_workers, batch_size=self.batch_size, sampler=val_sampler)
         # test_loader = DataLoader(test_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False)
 
-        self.logger.info(f"Train dataset size: {len(train_dataset)}")
-        self.logger.info(f"Validation dataset size: {len(val_dataset)}")
-        self.logger.info(f"Test dataset size: {len(test_dataset)}")
+        self.logger.info(f"Train dataset size: {len(train_indices)}")
+        self.logger.info(f"Validation dataset size: {len(val_indices)}")
+        self.logger.info(f"Test dataset size: {len(test_indices)}")
 
         # Create DataLoaders for training and validation
 
@@ -521,18 +521,21 @@ class HazardModel():
         """
         Train the model using the provided data loaders.
         """
-        self.logger.info(f'Training the model with :{len(self.train_loader)*self.batch_size} samples ')
+        self.logger.info(f'Training the model...') 
         if self.use_wandb:
             wandb.watch(self.model, log="all")
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay, ) # added L2 regularization
         # optimizer = torch.optim.SGD(self.model.parameters(), lr=self.learning_rate)
 
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, 
-            step_size=10,           # Reduce LR every 10 epochs
-            gamma=0.8               # Multiply LR by 0.5 (50% reduction)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.8,
+            patience=self.patience,
         )
+
+        loss_fn = BCELoss()
 
 
         self.epochs_without_improvement = 0
@@ -546,6 +549,7 @@ class HazardModel():
             train_loss = 0.0
             train_mae = 0.0
 
+            step = 0
             for inputs, labels in self.train_loader:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 # Reshape Labels to match output 
@@ -554,7 +558,10 @@ class HazardModel():
                 # Forward pass
                 outputs = self.model(inputs)
                 sample_weigts = labels * self.class_ratio + (1 - labels) 
-                loss = F.binary_cross_entropy(outputs, labels, weight=sample_weigts)
+
+                # loss = F.binary_cross_entropy(outputs, labels, weight=sample_weigts )
+                loss = loss_fn(outputs, labels)
+
                 mae = self.safe_mae(labels, outputs)
 
                 
@@ -577,6 +584,7 @@ class HazardModel():
             # Evaluate on validation data
             val_loss, val_mae = self.evaluate()
 
+            # Log epoch metrics
             self.logger.info(f"Epoch {epoch+1}/{self.epochs}")
             self.logger.info(f"Train Loss: {train_loss:.4f}, Train MAE: {train_mae:.4f}")
             self.logger.info(f"Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}")
@@ -598,7 +606,7 @@ class HazardModel():
                     break
 
             # Update learning rate
-            scheduler.step()
+            scheduler.step(val_loss)
             self.learning_rate = scheduler.get_last_lr()[0]
 
             end_time = time.time()
@@ -696,7 +704,7 @@ class HazardModel():
         self.model.eval()
         val_loss = 0.0
         val_mae = 0.0
-
+        loss_fn = BCELoss()
 
         with torch.no_grad():
             self.logger.info(f'Evaluating the model with :{len(self.val_loader)*self.batch_size} samples ')
@@ -709,7 +717,7 @@ class HazardModel():
                 
                 # Calculate metrics
                 # loss = self.safe_binary_crossentropy(labels, outputs)
-                loss = F.binary_cross_entropy(outputs, labels)
+                loss = loss_fn(outputs, labels)
                 mae = self.safe_mae(labels, outputs)
 
                 
@@ -922,7 +930,7 @@ class HazardModel():
 
         
         #get indices where mask is not nan and transform to 1D
-        map_indices2d = np.argwhere(np.isnan(elevation) == False)
+        map_indices2d = np.argwhere(elevation > 0)
         idx_transform = np.array([[elevation_shape[1]],[1]])
         map_indices1d = (map_indices2d @ idx_transform).flatten()
 
@@ -954,6 +962,7 @@ class HazardModel():
             hazard_map,
             title=f"{self.hazard} Hazard Map",
             name=f'{self.hazard} susceptibility',
+            type='continuous',
             downsample_factor=10,
             save_path=hazard_map_path)
         
@@ -963,7 +972,7 @@ class HazardModel():
 
 class ModelMgr:
     def __init__(self, region='Europe', batch_size=1024, patch_size=5, architecture='CNN' , sample_size = 1, 
-             class_ratio=0.5, sampler='custom', hazard='wildfire', hyper=False, use_wandb=True, experiement_name='HazardMapper'):
+             class_ratio=0.5, sampler='custom', hazard='wildfire', epoch = 5, hyper=False, use_wandb=True, experiement_name='HazardMapper'):
         
         self.early_stopping = True
         self.patience = 10
@@ -982,32 +991,30 @@ class ModelMgr:
         self.model_architecture = architecture # 'CNN' or 'UNet' or 'SimpleCNN' or 'SpatialAttentionCNN' or 'MLP'
         self.experiement_name = experiement_name
         self.sampler = sampler
+        self.epoch = epoch
 
         if self.hazard == 'landslide':
             self.variables = ['elevation', 'slope', 'landcover', 'aspect', 'NDVI', 'precipitation_daily', 'accuflux', 'HWSD', 'GEM', 'curvature', 'GLIM']
             self.var_types = ['continuous', 'continuous', 'categorical', 'continuous', 'continuous', 'continuous', 'continuous', 'categorical', 'continuous', 'continuous', 'categorical']
-            # self.variables = ['elevation', 'slope', 'landcover', 'NDVI', 'precipitation', 'HWSD']
-            # self.var_types = ['continuous', 'continuous', 'categorical', 'continuous', 'continuous', 'categorical']
-        elif self.hazard == 'Flood':
-            self.variables = ['elevation', 'slope', 'landcover', 'aspect', 'NDVI', 'precipitation', 'accuflux']
+            
+        elif self.hazard == 'flood':
+            self.variables = ['elevation', 'slope', 'landcover', 'aspect', 'NDVI', 'precipitation_daily', 'accuflux']
             self.var_types = ['continuous', 'continuous', 'categorical', 'continuous', 'continuous', 'continuous', 'continuous']
-        elif self.hazard == 'Tsunami':
-            self.variables = ['elevation', 'coastlines', 'GEM']
-            self.var_types = ['continuous', 'continuous', 'continuous']
-            # self.variables = ['coastlines']
-            # self.var_types = ['continuous']
+    
         elif self.hazard == "wildfire":
             # temperature_daily, NDVI, landcover, elevation, wind_speed, fire_weather, soil_moisture(root or surface)
             self.variables = ['temperature_daily', 'NDVI', 'landcover', 'elevation', 'wind_speed_daily', 'fire_weather', 'soil_moisture_root']
             self.var_types = ['continuous', 'continuous', 'categorical', 'continuous', 'continuous', 'continuous', 'continuous']
-        elif self.hazard == 'Multihazard':
-            # self.variables = ['drought', 'extreme_wind', 'fire_weather', 'heatwave', 'pga', 'volcano', 'Flood_hazard_model', 'landslide_hazard_model', 'Tsunami_hazard_model']
-            self.variables = ['drought', 'extreme_wind', 'fire_weather', 'heatwave', 'jshis', 'volcano', 'Flood_hazard_model', 'landslide_hazard_model', 'Tsunami_hazard_model']
-            self.var_types = ['continuous', 'continuous', 'continuous', 'continuous', 'continuous', 'continuous', 'continuous', 'continuous', 'continuous']
+        
         elif self.hazard == 'test':
             # temperature_daily, NDVI, landcover, elevation, wind_speed, fire_weather, soil_moisture(root or surface)
             self.variables = ['test']
             self.var_types = ['continuous']
+        
+        elif self.hazard == 'multi_hazard':
+            self.variables = ['drought', 'extreme_wind', 'heatwave', 'volcano', 'wildfire', 'landslide', 'flood']
+            self.var_types = ['continuous', 'continuous', 'continuous', 'continuous', 'continuous', 'continuous', 'continuous']
+        
         else:
             raise ValueError(f"Unknown hazard: {self.hazard}")
         
@@ -1047,6 +1054,7 @@ class ModelMgr:
                 logger=self.logger,
                 seed=self.seed,
                 use_wandb=self.use_wandb,
+                epoch=self.epoch,
                 early_stopping=self.early_stopping,
                 patience=self.patience,
                 min_delta=self.min_delta,
@@ -1054,7 +1062,7 @@ class ModelMgr:
             
                 
             )
-        elif self.model_architecture in ["RF", "LR"]:
+        elif self.model_architecture in ["RF", "LR", "MLPC"]:
             self.baseline_instance = Baseline(
                 hazard=self.hazard,
                 region=self.region,
@@ -1300,11 +1308,13 @@ if __name__ == "__main__":
     parser.add_argument('-b', '--batch_size', type=int, default=1024, help='Batch size for training')
     parser.add_argument('-p', '--patch_size', type=int, default=5, help='Patch size for model input')
     parser.add_argument('-a', '--architecture', type=str, default='SimpleCNN', help='Model architecture (FullCNN, UNet, MLP, LR, RF)')
+    parser.add_argument('-e', '--epochs', type=int, default=5, help='Number of training epochs')
     parser.add_argument('-s', '--sample_size', type=float, default=0.5, help='Sample size for training')
     parser.add_argument('-c', '--class_ratio', type=float, default=9, help='Ratio of negative to positive samples in the batch')
     parser.add_argument('-y', '--hyper', action='store_true', default=False,  help='Enable hyperparameter optimization')
     parser.add_argument('-w', '--use_wandb', action='store_true',default=True, help='Use Weights & Biases for logging')
     parser.add_argument('--sampler', type=str, default='default', help='Sampler type (custom or random)')
+    parser.add_argument('--map', action='store_true', default=False, help='Create hazard map after training')
     args = parser.parse_args()
 
     region = args.region
@@ -1312,12 +1322,15 @@ if __name__ == "__main__":
     batch_size = args.batch_size
     patch_size = args.patch_size
     architecture = args.architecture
+    epoch = args.epochs
     sample_size = args.sample_size
     class_ratio = args.class_ratio
     hyper = args.hyper
     use_wandb = args.use_wandb
     experiement_name = args.name
     sampler = args.sampler
+    make_map = args.map
+    
 
 
     # Initialize the model manager
@@ -1327,6 +1340,7 @@ if __name__ == "__main__":
         patch_size=patch_size,
         architecture=architecture,
         sample_size=sample_size,
+        epoch=epoch,
         class_ratio=class_ratio,
         hazard=hazard,
         hyper=hyper,
@@ -1338,8 +1352,11 @@ if __name__ == "__main__":
     # Train the base model
     # model_mgr.train_hazard_model()
 
-    if architecture in ['RF', 'LR']:
+    if architecture in ['RF', 'LR', 'MLPC']:
         model_mgr.train_baseline_model()
     else:   
         model_mgr.train_hazard_model()
-    # model_mgr.make_hazard_map()
+    
+    # If specified, create a hazard map
+    if make_map:
+        model_mgr.make_hazard_map()

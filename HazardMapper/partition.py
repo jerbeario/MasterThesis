@@ -1,7 +1,14 @@
+""" HazardMapper - Partition Map Creation
+=========================================
+This module provides functions to create and manage partition maps for hazard datasets, including
+creating partition maps based on hazard occurrences, cleaning partition maps, eroding borders to prevent data leakage, balancing partitions and downsampling to a given size.
+"""
+
 from scipy.ndimage import binary_erosion
 
 import numpy as np
 import sys
+import argparse
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -15,10 +22,12 @@ import time
 from multiprocessing import Pool
 import os
 
-def create_partition_map(region: np.ndarray, mask: np.ndarray, hazard: np.ndarray, seed: int = 42) -> np.ndarray:
+from HazardMapper.utils import plot_npy_arrays
+
+def create_partition_map(region: np.ndarray, mask: np.ndarray, hazard: np.ndarray, seed: int = 42, train_ratio = 0.8) -> np.ndarray:
     """
     Randomly assigns only regions with hazard occurrences to train (1), val (2), or test (3) partitions
-    with proportions 70%, 15%, 15%. Outputs a partition map with the same shape.
+    with proportions train_ratio, (1-train_ration)/2, (1-train_ration)/2 . Outputs a partition map with the same shape.
     
     Args:
         region (np.ndarray): Array with unique identifiers for each country/region
@@ -31,7 +40,8 @@ def create_partition_map(region: np.ndarray, mask: np.ndarray, hazard: np.ndarra
     """
     print("Creating partition map with hazard filtering...")
     np.random.seed(seed)
-    
+
+    val_ratio = (1-train_ratio)/2
 
     partition_map = np.zeros_like(region, dtype=np.uint8)
     hazard_mask = (hazard > 0)
@@ -39,32 +49,39 @@ def create_partition_map(region: np.ndarray, mask: np.ndarray, hazard: np.ndarra
     countries_with_hazards = np.unique(region[hazard_mask])
     countries_with_hazards = countries_with_hazards[countries_with_hazards != 0]
     
-    print(f"Found {len(countries_with_hazards)} countries/regions with hazard occurrences")
+    print(f"Found {len(countries_with_hazards)} regions with hazard occurrences")
     
     # Only partition countries that have hazards
     if len(countries_with_hazards) > 0:
         np.random.shuffle(countries_with_hazards)
         
         n = len(countries_with_hazards)
-        train_ids = countries_with_hazards[:int(0.7 * n)]
-        val_ids = countries_with_hazards[int(0.7 * n):int(0.85 * n)]
-        test_ids = countries_with_hazards[int(0.85 * n):]
+        train_ids = countries_with_hazards[:int(train_ratio * n)]
+        val_ids = countries_with_hazards[int(train_ratio * n):int((train_ratio+val_ratio) * n)]
+        test_ids = countries_with_hazards[int((train_ratio+val_ratio) * n):]
         
-        print(f"Train: {len(train_ids)} countries, Val: {len(val_ids)} countries, Test: {len(test_ids)} countries")
+        print(f"Train: {len(train_ids)} regions, Val: {len(val_ids)} regions, Test: {len(test_ids)} regions")
         
         # Assign partition values
         partition_map[np.isin(region, train_ids)] = 1
         partition_map[np.isin(region, val_ids)] = 2
         partition_map[np.isin(region, test_ids)] = 3
     else:
-        print("Warning: No countries found with hazard occurrences!")
+        print("Warning: No regions found with hazard occurrences!")
     
     # Apply the mask to the partition map
     mask_array = np.isnan(mask)
     partition_map[mask_array] = 0
+
+    # If flood hazard, remove water types from landcover
+    if hazard_name == "floods":
+        landcover = np.load("Input/Europe/npy_arrays/masked_landcover_Europe_flat.npy")
+        water_types = [210]  # Example water types in landcover
+        water_mask = np.isin(landcover, water_types)
+        partition_map[water_mask] = 0  # Set water areas to 0 (ignored)
     
     # Print statistics
-    print(f"Final partition counts: Train: {np.sum(partition_map == 1)}, "
+    print(f"Initial partition counts: Train: {np.sum(partition_map == 1)}, "
           f"Val: {np.sum(partition_map == 2)}, Test: {np.sum(partition_map == 3)}")
     
     return partition_map
@@ -106,219 +123,116 @@ def erode_partition_borders(partition_map: np.ndarray, kernel_size: int = 5) -> 
         border_mask = (partition_map == label) & (eroded_map != label)
         eroded_map[border_mask] = 0
     return eroded_map
+import numpy as np
 
-def balance_partition_map(partition_map: np.ndarray, labels: np.ndarray, countries: np.ndarray, seed: int = 42) -> np.ndarray:
+def balance_partition_map(partition_map: np.ndarray, labels: np.ndarray, regions: np.ndarray, seed: int = 42) -> np.ndarray:
     """
-    - Balances the training set (1) by downsampling negative examples to match the number of positives.
-    - Reduces the size of validation (2) and test (3) sets to 15% of the training size each,
-      while maintaining the original positive/negative ratio.
+    Balances each split (train/val/test) by downsampling negative (label=0) cells 
+    to match the number of positive (label=1) cells within each region.
 
     Args:
-        partition_map (np.ndarray): Partition map with values 1 (train), 2 (val), 3 (test).
-        labels (np.ndarray): Binary labels (1 = positive, 0 = negative).
-        countries (np.ndarray): Country codes for each pixel.
-        seed (int): Random seed for reproducibility.
+        partition_map (np.ndarray): 2D array (H, W) with values 0=ignore, 1=train, 2=val, 3=test
+        labels (np.ndarray): 2D array (H, W) with values 0=no hazard, 1=hazard
+        regions (np.ndarray): 2D array (H, W) with region IDs per pixel
+        seed (int): Random seed
 
     Returns:
-        np.ndarray: Balanced partition map.
+        np.ndarray: Balanced partition map with same shape
     """
-    np.random.seed(seed)
-    balanced_map = partition_map
+    rng = np.random.default_rng(seed)
 
-    # 1. Process the training set (1) - Balance positive and negative samples
-    for split in [1]:
-        print(f"Processing split {split} (Training)...")
-        country_ids = np.unique(countries[partition_map == split])
+    flat_partition = partition_map.ravel()
+    flat_labels = labels.ravel()
+    flat_regions = regions.ravel()
+    balanced_map = flat_partition.copy()
 
-        for cid in country_ids:
-            mask = (partition_map == split) & (countries == cid)
-            pos_inds = np.argwhere(mask & (labels == 1))
-            neg_inds = np.argwhere(mask & (labels == 0))
-            
-            if len(pos_inds) == 0 or len(neg_inds) == 0:
-                # No positives or no negatives, skip
-                balanced_map[mask & (labels == 0)] = 0
+    for split in [1, 2, 3]:
+        print(f"Balancing split {split}...")
+        split_mask = flat_partition == split
+        region_ids = np.unique(flat_regions[split_mask])
+
+        for rid in region_ids:
+            region_mask = split_mask & (flat_regions == rid)
+
+            region_indices = np.flatnonzero(region_mask)
+            region_labels = flat_labels[region_indices]
+
+            pos_indices = region_indices[region_labels == 1]
+            neg_indices = region_indices[region_labels == 0]
+
+            if len(pos_indices) == 0 or len(neg_indices) == 0:
+                # No balancing possible, skip
+                balanced_map[neg_indices] = 0  # discard all negatives if no positives
                 continue
 
-            # Downsample negatives to match number of positives
-            if len(neg_inds) > len(pos_inds):
-                selected_neg_inds = neg_inds[np.random.choice(len(neg_inds), size=len(pos_inds), replace=False)]
-                # Create masks
-                all_neg_mask = np.zeros_like(mask, dtype=bool)
-                all_neg_mask[tuple(neg_inds.T)] = True
-                keep_mask = np.zeros_like(mask, dtype=bool)
-                keep_mask[tuple(selected_neg_inds.T)] = True
-                discard_mask = all_neg_mask & ~keep_mask
-                balanced_map[discard_mask] = 0
+            if len(neg_indices) > len(pos_indices):
+                discard_count = len(neg_indices) - len(pos_indices)
+                discard_indices = rng.choice(neg_indices, size=discard_count, replace=False)
+                balanced_map[discard_indices] = 0  # set to ignore
 
-    # 2. Determine target sizes for val/test (15% of training size each)
-    n_train = np.sum(balanced_map == 1)
-    n_total = int(n_train/0.7)
-    target_val_test_size = int(n_total * 0.15)
+    # Logging final stats
+    for split in [1, 2, 3]:
+        mask = balanced_map == split
+        count = np.bincount(flat_labels[mask].astype(int), minlength=2)
+        print(f"Split {split}: Positives = {count[1]}, Negatives = {count[0]}")
 
-    # 3. Process validation (2) and test (3) sets
-    for split in [2, 3]:
-        print(f"Processing split {split}...")
-        indices = np.argwhere(balanced_map == split)
+    return balanced_map.reshape(partition_map.shape)
 
-        # Separate positives and negatives
-        pos_inds = indices[labels[indices[:, 0], indices[:, 1]] == 1]
-        neg_inds = indices[labels[indices[:, 0], indices[:, 1]] == 0]
 
-        # Calculate desired sample sizes while maintaining the original ratio
-        total_samples = len(pos_inds) + len(neg_inds)
-        pos_ratio = len(pos_inds) / total_samples if total_samples > 0 else 0
-        num_pos = int(target_val_test_size * pos_ratio)
-        num_neg = target_val_test_size - num_pos
-
-        # Ensure we don't exceed available samples
-        num_pos = min(num_pos, len(pos_inds))
-        num_neg = min(num_neg, len(neg_inds))
-
-        # Random sampling
-        selected_pos_inds = pos_inds[np.random.choice(len(pos_inds), size=num_pos, replace=False)]
-        selected_neg_inds = neg_inds[np.random.choice(len(neg_inds), size=num_neg, replace=False)]
-
-        # Create discard mask
-        all_pos_mask = np.zeros_like(balanced_map, dtype=bool)
-        all_neg_mask = np.zeros_like(balanced_map, dtype=bool)
-        all_pos_mask[tuple(pos_inds.T)] = True
-        all_neg_mask[tuple(neg_inds.T)] = True
-
-        keep_pos_mask = np.zeros_like(balanced_map, dtype=bool)
-        keep_neg_mask = np.zeros_like(balanced_map, dtype=bool)
-        keep_pos_mask[tuple(selected_pos_inds.T)] = True
-        keep_neg_mask[tuple(selected_neg_inds.T)] = True
-
-        discard_pos_mask = all_pos_mask & ~keep_pos_mask
-        discard_neg_mask = all_neg_mask & ~keep_neg_mask
-
-        # Apply discard mask
-        balanced_map[discard_pos_mask | discard_neg_mask] = 0
-
-    print(f"Final counts - Train: {np.sum(balanced_map == 1)}, Val: {np.sum(balanced_map == 2)}, Test: {np.sum(balanced_map == 3)}")
-
-    return balanced_map
-
-# def plot_npy_arrays(npy_files, npy_names, partition_map=False, debug_nans=False, log=False, downsample_factor=1, save_path=None):
-#     """
-#     Plots the data from npy files on a map with the correct coordinates.
-
-#     Parameters:
-#     npy_files (list): List of file paths to the npy files.
-#     npy_names (list): List of names corresponding to the npy files.
-#     extents (list): List of extents (geographical bounds) for each npy file.
-
-#     Returns:
-#     None
-#     """
-#     extent = (-25.0001389, 45.9998611,  27.0001389, 73.0001389)
-
-#     if isinstance(npy_files, np.ndarray):
-#         npy_files = [npy_files]
-#         npy_names = [npy_names]
+def sample_partition_map(partition_map: np.ndarray, size = 1, seed: int = 42) -> np.ndarray:
+    """
+    Samples a partition map by downsampling the total dataset size to size .
     
-#     for i, npy_file in enumerate(npy_files):
+    Args:
+        partition_map (np.ndarray): Array with partition values (1=train, 2=val, 3=test)
+        size (int): Desired number of samples to return
+        seed (int): Random seed for reproducibility
+    
+    Returns:
+        np.ndarray: Sampled partition map with same shape
+    """
+    print("Sampling partition map...")
+    np.random.seed(seed)
+    
+    # Flatten the partition map and select dataset cells
+    flat_partition = partition_map.ravel()
+    dataset = (partition_map == 1) | (partition_map == 2) | (partition_map == 3)
+    total_size = np.sum(dataset)
 
-#         name = npy_names[i]
-
-#         # Create a subplot with PlateCarree projection
-#         fig, axs = plt.subplots(figsize=(8, 8), subplot_kw={'projection': ccrs.PlateCarree()})
-
-#         print(npy_names[i])
-
-#         if isinstance(npy_file, str):
-#             npy_data = np.load(npy_file)
-#             print("File loaded")
-#         elif isinstance(npy_file, np.ndarray):
-#             npy_data = npy_file
-#             print("Array loaded")
-
-
-#         if downsample_factor > 1:
-#             npy_data = npy_data[::downsample_factor, ::downsample_factor]
-#             print(f"Downsampled data shape: {npy_data.shape}")
+    if size > total_size:
+        print(f"Warning: Requested size {size} exceeds total dataset size {total_size}. Returning full dataset.")
+        return partition_map
+    
+    elif size <= 0:
+        print("Warning: Requested size is 0 or negative. Returning empty partition map.")
+        return np.zeros_like(partition_map)
+    else:
+        # Randomly sample indices
+        sampled_indices = np.random.choice(np.flatnonzero(dataset), size=size, replace=False)
         
-#         if log:
-#             npy_data = np.log1p(npy_data)
-      
-#         if debug_nans:
-#             # set everything to 0 except for NaNs
-#             npy_data[~np.isnan(npy_data)] = 0
-#             npy_data[np.isnan(npy_data)] = 1
+        # Create partition map where kept training are 1, val are 2, and test are 3
+        sampled_partition_map = np.zeros_like(flat_partition, dtype=np.uint8)
+        sampled_partition_map[sampled_indices] = flat_partition[sampled_indices]
 
-#         # Normalize the colorbar to the range [0, 1] (adjust as needed)
-#         # norm = Normalize(vmin=0, vmax=np.max(npy_data))
+        # Reshape back to original shape
+        sampled_partition_map = sampled_partition_map.reshape(partition_map.shape)
 
-#         # Plot the data on the subplot grid
-#         im = axs.imshow(npy_data, cmap='viridis', extent=extent)
-#         print("image created")
-
-#         # Set title for each subplot
-#         axs.set_title(f'European {name} Map', fontsize=16)
-
-#         # Set longitude tick labels
-#         axs.set_xticks(np.arange(extent[0], extent[1] + 1, 5), crs=ccrs.PlateCarree())
-#         axs.xaxis.set_major_formatter(mticker.StrMethodFormatter('{x:.0f}°'))
-
-#         # Set latitude tick labels
-#         axs.set_yticks(np.arange(extent[2], extent[3] + 1, 5), crs=ccrs.PlateCarree())
-#         axs.yaxis.set_major_formatter(mticker.StrMethodFormatter('{x:.0f}°'))
-
-#         axs.set_xlabel('Longitude')
-#         axs.set_ylabel('Latitude')
-
-#         # Add coastlines and country borders
-#         axs.add_feature(cfeature.COASTLINE, linewidth=0.1, edgecolor='black')
-#         axs.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.1)
-#         axs.add_feature(cfeature.LAND, facecolor='#FFEB3B', alpha=0.1)
-#         axs.add_feature(cfeature.OCEAN, facecolor='#A6CAE0')
-
-
-#         # # crop the map to the extent
-#         # croped_extent = (-5, 10, 40, 52)
-#         # axs.set_extent(croped_extent, crs=ccrs.PlateCarree())
-
-
-#         # Adjust layout for better spacing
-#         plt.tight_layout()
-#         # plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.05)   
+        return sampled_partition_map
     
-#         # Add a colorbar for all subplots
-#         if not partition_map:
-#             cbar = fig.colorbar(im, ax=axs, orientation='horizontal', fraction=0.05, pad=0.1)
-#             cbar.set_label(f'{name} counts', fontsize=16)
-#             if log:
-#                 cbar.set_label(f'log {name} counts', fontsize=16)
-
-#             cbar.ax.tick_params(labelsize=12) 
-#         else:
-#             labels = ['Ignored', 'Train', 'Validation', 'Test']
-#             colors = plt.cm.viridis(np.linspace(0, 1, 4)) 
-#             patches =[mpatches.Patch(color=color,label=labels[i]) for i, color in enumerate(colors)]
-#             fig.legend(handles=patches, loc='upper center', bbox_to_anchor=(0.53, 0.15),
-#             fancybox=True, ncol=4)
-
-
-
-#         # # Set the colorbar ticks and labels
-#         # cbar.set_ticks(np.arange(0, 1.1, 0.1))  # Ticks from 0 to 1 with 0.1 increments
-#         # cbar.set_ticklabels([f'{i:.1f}' for i in np.arange(0, 1.1, 0.1)])
-
- 
-
-#         # Save the plot
-#         if save_path is not None:
-#             plt.savefig(save_path, dpi=1000, bbox_inches='tight')
 
 
 if __name__ == "__main__":
+
+    argparse = argparse.ArgumentParser(description="Create partition map for a specific hazard in Europe.")
+    argparse.add_argument("-z", "--hazard", type=str, help="Name of the hazard to create partition map for (e.g., floods, wildfires, landlside).")
+    argparse.add_argument("-n", "--n_samples", type=int, default=1_000_000, help="Number of samples to downsample the partition map to.")
+    args = argparse.parse_args()
     
     
     seed = 42
     # input hazard name
-    hazard_name = sys.argv[1]
-
+    hazard_name = args.hazard
+    n_samples = args.n_samples
 
     # countries = np.load("Input/Europe/partition_map/countries_rasterized.npy")
     sub_countries = np.load("Input/Europe/partition_map/sub_countries_rasterized.npy")
@@ -328,15 +242,14 @@ if __name__ == "__main__":
     hazard[hazard > 0] = 1
 
 
-
     partition_map = create_partition_map(region=sub_countries, mask=elevation, hazard=hazard, seed=seed)
     partition_map = erode_partition_borders(partition_map, kernel_size=5)
-    # partition_map = balance_partition_map(partition_map, wildfires, sub_countries, seed=seed)
-    
-    
+    partition_map = balance_partition_map(partition_map, hazard, sub_countries, seed=seed)
+    partition_map = sample_partition_map(partition_map, size=n_samples, seed=seed)
 
-    np.save(f"Input/Europe/partition_map/{hazard_name}_partition_map.npy", partition_map)
-    # plot_npy_arrays(partition_map, f"{hazard_name} Partition", partition_map=True, downsample_factor=10, save_path=f"Input/Europe/partition_map/{hazard_name}_partition_map.png")
+
+    np.save(f"Input/Europe/partition_map/balanced_{hazard_name}_partition_map.npy", partition_map)
+    plot_npy_arrays(partition_map, name="partition",title=f"{hazard_name.capitalize()} Partition Map", type="partition", downsample_factor=10, save_path=f"Input/Europe/partition_map/balanced_{hazard_name}_partition_map.png")
 
 
    

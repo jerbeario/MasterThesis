@@ -12,5 +12,5 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate MasterThesis
 
-python normalize.py 
+python HazardMapper/utils.py 
 wait

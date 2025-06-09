@@ -186,5 +186,5 @@ wandb/
 
 .DS_Store
 
-
+*.npy
 Output/Europe/landslide/landslide_hazard_map.npy
